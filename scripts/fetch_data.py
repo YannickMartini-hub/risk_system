@@ -30,10 +30,17 @@ logger = logging.getLogger("fetch_data")
 
 
 def _load_tickers() -> list[str]:
-    """Charge la liste des 50 tickers depuis data/reference/."""
+    """Charge la liste des tickers depuis data/reference/ (colonne 'Sigle')."""
     from risk_system.config import SETTINGS
-    df = pd.read_excel(SETTINGS.tickers_file, header=None)
-    return df.iloc[:, 0].dropna().tolist()
+    df = pd.read_excel(SETTINGS.tickers_file, header=0)   # première ligne = en-tête
+    # dropna + déduplique en conservant l'ordre
+    seen: set[str] = set()
+    result: list[str] = []
+    for t in df.iloc[:, 0].dropna():
+        if t not in seen:
+            seen.add(t)
+            result.append(t)
+    return result
 
 
 def _parse_args() -> argparse.Namespace:
