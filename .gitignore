@@ -2,3 +2,11 @@
 __pycache__/
 *.pyc
 .env
+data/parquet/
+*.parquet
+.ipynb_checkpoints/
+dist/
+*.egg-info/
+.pytest_cache/
+*.pyo
+*.pyd
