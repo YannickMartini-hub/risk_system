@@ -204,6 +204,7 @@ def fetch_symbol(
     symbol: str,
     r: Optional[float] = None,
     q: Optional[float] = None,
+    max_expiries: Optional[int] = None,
 ) -> pd.DataFrame:
     """
     Extrait les options pour un symbole, calcule IV + grecs, filtre delta.
@@ -270,6 +271,8 @@ def fetch_symbol(
                 symbol, param.exchange, param.tradingClass)
 
     expiries = _select_expiries(list(param.expirations))
+    if max_expiries is not None:
+        expiries = expiries[:max_expiries]
     if not expiries:
         logger.warning("[%s] Aucune maturité future.", symbol)
         return pd.DataFrame()
