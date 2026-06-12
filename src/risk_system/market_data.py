@@ -21,8 +21,6 @@ from .implied_vol import implied_vol
 logger = logging.getLogger(__name__)
 
 # ── constantes de configuration ───────────────────────────────────────────────
-_REF_VOL    = 0.25    # vol de référence pour le pré-filtrage des strikes
-_N_SIGMAS   = 2.0     # demi-largeur de la fenêtre en nombre de σ√T
 # Maturités cibles (jours calendaires) : 2 semaines → 36 mois
 _TARGET_MATURITIES_DAYS = (14, 30, 91, 182, 273, 365, 548, 730, 1095)
 # Écart max toléré entre une cible et l'échéance cotée la plus proche.
@@ -50,17 +48,6 @@ def _expiry_to_iso(expiry_str: str) -> str:
     return f"{expiry_str[:4]}-{expiry_str[4:6]}-{expiry_str[6:8]}"
 
 
-def _strike_window(spot: float, T: float) -> tuple[float, float]:
-    """
-    Fenêtre de strikes : intersection de ±_N_SIGMAS*σ_ref*√T et [0.80S, 1.20S].
-    Évite d'interroger des strikes dont le delta sera systématiquement hors filtre.
-    """
-    width = _REF_VOL * math.sqrt(max(T, 1e-4)) * _N_SIGMAS
-    lo = max(spot * math.exp(-width), 0.80 * spot)
-    hi = min(spot * math.exp(+width), 1.20 * spot)
-    return lo, hi
-
-
 def _expiry_days(expiry_str: str) -> int:
     """Jours calendaires entre aujourd'hui et l'échéance."""
     return (datetime.strptime(expiry_str, "%Y%m%d") - datetime.now()).days
@@ -85,25 +72,6 @@ def _select_expiries(expirations: list[str]) -> list[str]:
         if best_e is not None and best_gap <= _MATURITY_TOL_DAYS:
             chosen.add(best_e)
     return sorted(chosen)
-
-
-def _in_delta_band(delta_val: float, right: str, q: float, T: float) -> bool:
-    """
-    Bande "du put 30Δ au call 30Δ" autour de l'ATM.
-
-    On convertit en delta call-équivalent via la parité des deltas
-    (Δ_put = Δ_call − e^(-qT)) :
-        Δc = delta            si call
-        Δc = delta + e^(-qT)  si put
-    et on conserve si  |DELTA_MIN| ≤ Δc ≤ e^(-qT) − DELTA_MAX,
-    soit [0.30, 0.70] pour q = 0. ATM (Δc ≈ 0.50) inclus ;
-    deep ITM (Δc > 0.70) et deep OTM (Δc < 0.30) exclus.
-    """
-    disc_q = math.exp(-q * T)
-    d_call = delta_val if right == "C" else delta_val + disc_q
-    lo = abs(SETTINGS.DELTA_MIN)
-    hi = disc_q - SETTINGS.DELTA_MAX
-    return lo <= d_call <= hi
 
 
 # ── construction des contrats IBKR ────────────────────────────────────────────
@@ -296,17 +264,7 @@ def fetch_symbol(
             logger.debug("[%s %s] Aucun contrat coté.", symbol, expiry)
             continue
 
-        # Pré-filtrage par fenêtre de strikes (≈ |delta| ≤ 0.30)
-        lo, hi = _strike_window(spot, T)
-        contracts = [c for c in contracts if lo <= c.strike <= hi]
-        if not contracts:
-            logger.debug(
-                "[%s %s] Aucun strike dans la fenêtre (%.0f–%.0f).",
-                symbol, expiry, lo, hi,
-            )
-            continue
-
-        logger.info("[%s %s] %d contrats dans la fenêtre.", symbol, expiry, len(contracts))
+        logger.info("[%s %s] %d contrats disponibles.", symbol, expiry, len(contracts))
 
         # Lots de _BATCH_SIZE contrats
         for i in range(0, len(contracts), _BATCH_SIZE):
@@ -320,10 +278,18 @@ def fetch_symbol(
                     def _f(x) -> float:
                         return float(x) if x is not None and x == x and x > 0 else math.nan
 
-                    bid  = _f(ticker.bid)
-                    ask  = _f(ticker.ask)
-                    last = _f(ticker.last)
+                    def _fvol(x) -> float:
+                        # Volume : 0 est valide, négatif/NaN → NaN
+                        if x is None or x != x:
+                            return math.nan
+                        v = float(x)
+                        return v if v >= 0 else math.nan
+
+                    bid   = _f(ticker.bid)
+                    ask   = _f(ticker.ask)
+                    last  = _f(ticker.last)
                     close = _f(ticker.close)
+                    volume = _fvol(ticker.volume)
 
                     if math.isfinite(bid) and math.isfinite(ask):
                         mid = (bid + ask) / 2.0
@@ -347,6 +313,7 @@ def fetch_symbol(
                         "Bid":      bid,
                         "Ask":      ask,
                         "Mid":      mid,
+                        "Volume":   volume,
                     })
                 except Exception as exc:
                     logger.debug("[%s] Erreur lecture ticker %s : %s", symbol, c, exc)
@@ -367,9 +334,6 @@ def fetch_symbol(
             right=row["Type"], multiplier=multiplier,
         )
 
-        if not _in_delta_band(g["Delta"], row["Type"], q, row["T"]):
-            continue
-
         records.append({
             "Symbol":     row["Symbol"],
             "Spot":       row["Spot"],
@@ -380,6 +344,7 @@ def fetch_symbol(
             "Bid":        row["Bid"],
             "Ask":        row["Ask"],
             "Mid":        row["Mid"],
+            "Volume":     row["Volume"],
             "ImpliedVol": iv,
             "Delta":      g["Delta"],
             "Gamma":      g["Gamma"],
@@ -389,7 +354,7 @@ def fetch_symbol(
         })
 
     result = pd.DataFrame(records)
-    logger.info("[%s] %d lignes dans la bande [put 30Δ, call 30Δ].", symbol, len(result))
+    logger.info("[%s] %d lignes collectées (tous strikes).", symbol, len(result))
     return result
 
 
