@@ -23,9 +23,17 @@ logger = logging.getLogger(__name__)
 # ── constantes de configuration ───────────────────────────────────────────────
 _REF_VOL    = 0.25    # vol de référence pour le pré-filtrage des strikes
 _N_SIGMAS   = 2.0     # demi-largeur de la fenêtre en nombre de σ√T
-_N_EXPIRIES = 6       # maturités mensuelles conservées
+# Maturités cibles (jours calendaires) : 2 semaines → 36 mois
+_TARGET_MATURITIES_DAYS = (14, 30, 91, 182, 273, 365, 548, 730, 1095)
+# Écart max toléré entre une cible et l'échéance cotée la plus proche.
+_MATURITY_TOL_DAYS = 45
 _BATCH_SIZE = 50      # contrats par lot de reqMktData
 _SLEEP_SECS = 2.0     # pause après chaque lot (respect des limites IB)
+
+# Type de market data :
+# 1 = temps réel (abonnement requis), 3 = différé, 4 = différé-figé.
+# 3 retombe automatiquement sur le temps réel si l'abonnement existe.
+_MARKET_DATA_TYPE = 3
 
 
 # ── helpers de conversion ─────────────────────────────────────────────────────
@@ -53,31 +61,140 @@ def _strike_window(spot: float, T: float) -> tuple[float, float]:
     return lo, hi
 
 
-def _select_expiries(expirations: list[str], max_n: int = _N_EXPIRIES) -> list[str]:
-    """Retourne au plus max_n maturités futures triées par date croissante."""
-    today = date.today().strftime("%Y%m%d")
-    return sorted(e for e in expirations if e >= today)[:max_n]
+def _expiry_days(expiry_str: str) -> int:
+    """Jours calendaires entre aujourd'hui et l'échéance."""
+    return (datetime.strptime(expiry_str, "%Y%m%d") - datetime.now()).days
+
+
+def _select_expiries(expirations: list[str]) -> list[str]:
+    """
+    Pour chaque maturité cible, retient l'échéance cotée future dont le
+    nombre de jours est le plus proche, si l'écart reste sous la tolérance.
+    Déduplique et trie par date croissante.
+    """
+    futures = [(e, _expiry_days(e)) for e in expirations if _expiry_days(e) > 0]
+    if not futures:
+        return []
+    chosen = set()
+    for target in _TARGET_MATURITIES_DAYS:
+        best_e, best_gap = None, None
+        for e, days in futures:
+            gap = abs(days - target)
+            if best_gap is None or gap < best_gap:
+                best_e, best_gap = e, gap
+        if best_e is not None and best_gap <= _MATURITY_TOL_DAYS:
+            chosen.add(best_e)
+    return sorted(chosen)
+
+
+def _in_delta_band(delta_val: float, right: str, q: float, T: float) -> bool:
+    """
+    Bande "du put 30Δ au call 30Δ" autour de l'ATM.
+
+    On convertit en delta call-équivalent via la parité des deltas
+    (Δ_put = Δ_call − e^(-qT)) :
+        Δc = delta            si call
+        Δc = delta + e^(-qT)  si put
+    et on conserve si  |DELTA_MIN| ≤ Δc ≤ e^(-qT) − DELTA_MAX,
+    soit [0.30, 0.70] pour q = 0. ATM (Δc ≈ 0.50) inclus ;
+    deep ITM (Δc > 0.70) et deep OTM (Δc < 0.30) exclus.
+    """
+    disc_q = math.exp(-q * T)
+    d_call = delta_val if right == "C" else delta_val + disc_q
+    lo = abs(SETTINGS.DELTA_MIN)
+    hi = disc_q - SETTINGS.DELTA_MAX
+    return lo <= d_call <= hi
 
 
 # ── construction des contrats IBKR ────────────────────────────────────────────
 
-def _make_underlying(symbol: str):
-    """Index pour SX5E (Eurex), Stock pour les 50 composants."""
+_CURRENCIES = ("EUR", "CHF", "GBP", "USD")
+
+# Bourses dérivés européennes préférées pour la sonde d'options
+_PREFERRED_OPT_EXCHANGES = (
+    "EUREX", "MONEP", "FTA", "SOFFEX", "IDEM", "MEFFRV", "OMS", "DTB",
+)
+
+
+def _resolve_underlying(ib, symbol: str):
+    """
+    Résout le contrat sous-jacent.
+    Index Eurex pour SX5E ; sinon Stock en essayant plusieurs devises
+    (certains tickers de la liste ne cotent pas en EUR, ex: UBSG en CHF).
+    Retourne le contrat qualifié, ou None.
+    """
     from ib_insync import Index, Stock
+
     if symbol == "SX5E":
-        return Index("ESTX50", "EUREX", "EUR")
-    return Stock(symbol, "SMART", "EUR")
+        qualified = ib.qualifyContracts(Index("ESTX50", "EUREX", "EUR"))
+        return qualified[0] if qualified else None
+
+    for ccy in _CURRENCIES:
+        try:
+            qualified = ib.qualifyContracts(Stock(symbol, "SMART", ccy))
+        except Exception:
+            qualified = []
+        if qualified:
+            if ccy != "EUR":
+                logger.info("[%s] Résolu en %s (pas EUR).", symbol, ccy)
+            return qualified[0]
+    return None
 
 
-def _make_option(symbol: str, expiry: str, strike: float, right: str):
-    """Crée le contrat Option adapté au sous-jacent."""
+def _select_option_param(params: list, symbol: str):
+    """
+    Choisit l'entrée de reqSecDefOptParams à utiliser pour la sonde.
+
+    Les options européennes ne sont pas SMART-routables : il faut
+    interroger la bourse dérivés native (MONEP, EUREX...). On préfère
+    donc une bourse connue, sinon la première entrée non-SMART,
+    sinon la première tout court.
+    """
+    if symbol == "SX5E":
+        oesx = [p for p in params if p.tradingClass == "OESX"]
+        if oesx:
+            return oesx[0]
+
+    for exch in _PREFERRED_OPT_EXCHANGES:
+        for p in params:
+            if p.exchange == exch:
+                return p
+    non_smart = [p for p in params if p.exchange != "SMART"]
+    if non_smart:
+        return non_smart[0]
+    return params[0]
+
+
+def _valid_contracts_for_expiry(
+    ib, symbol: str, expiry: str, exchange: str, trading_class: str, currency: str,
+) -> list:
+    """
+    Récupère, en UNE requête, tous les contrats d'options réellement
+    existants pour (symbole, échéance) via reqContractDetails, sur la
+    bourse dérivés native du sous-jacent.
+
+    Les contrats retournés sont déjà entièrement qualifiés (conId inclus) :
+    plus besoin de qualifyContracts.
+    """
     from ib_insync import Option
+
+    probe = Option(
+        "ESTX50" if symbol == "SX5E" else symbol,
+        lastTradeDateOrContractMonth=expiry,
+        exchange=exchange,
+        currency=currency,
+    )
+    if trading_class:
+        probe.tradingClass = trading_class
     if symbol == "SX5E":
-        return Option(
-            "ESTX50", expiry, strike, right,
-            exchange="EUREX", multiplier="10", currency="EUR",
-        )
-    return Option(symbol, expiry, strike, right, exchange="SMART", currency="EUR")
+        probe.multiplier = "10"
+
+    try:
+        details = ib.reqContractDetails(probe)
+    except Exception as exc:
+        logger.warning("[%s %s] reqContractDetails échoué : %s", symbol, expiry, exc)
+        return []
+    return [d.contract for d in details]
 
 
 # ── extraction pour un symbole ────────────────────────────────────────────────
@@ -103,14 +220,16 @@ def fetch_symbol(
     q = q if q is not None else SETTINGS.q
     multiplier = SETTINGS.MULTIPLIER if symbol == "SX5E" else 1
 
+    # Données différées si pas d'abonnement temps réel (idempotent).
+    ib.reqMarketDataType(_MARKET_DATA_TYPE)
+
     # ── 1. spot ───────────────────────────────────────────────────────────
     try:
-        underlying = _make_underlying(symbol)
-        qualified = ib.qualifyContracts(underlying)
-        if not qualified:
-            logger.warning("[%s] Contrat introuvable.", symbol)
+        underlying = _resolve_underlying(ib, symbol)
+        if underlying is None:
+            logger.warning("[%s] Contrat introuvable (devises testées : %s).",
+                           symbol, ", ".join(_CURRENCIES))
             return pd.DataFrame()
-        underlying = qualified[0]
 
         bars = ib.reqHistoricalData(
             underlying,
@@ -130,7 +249,7 @@ def fetch_symbol(
         logger.error("[%s] Erreur lors de la récupération du spot : %s", symbol, exc)
         return pd.DataFrame()
 
-    # ── 2. paramètres options ──────────────────────────────────────────────
+    # ── 2. liste des maturités disponibles ────────────────────────────────
     try:
         params = ib.reqSecDefOptParams(
             underlying.symbol, "", underlying.secType, underlying.conId
@@ -143,13 +262,14 @@ def fetch_symbol(
         logger.error("[%s] Erreur reqSecDefOptParams : %s", symbol, exc)
         return pd.DataFrame()
 
-    all_strikes: set[float] = set()
-    all_expiries: set[str]  = set()
-    for p in params:
-        all_strikes.update(p.strikes)
-        all_expiries.update(p.expirations)
+    # Sélection de la bourse dérivés native + sa trading class :
+    # on n'utilise QUE les échéances de cette entrée (cohérence garantie
+    # entre échéances, strikes et bourse — fin des erreurs 200).
+    param = _select_option_param(params, symbol)
+    logger.info("[%s] Options via %s (tradingClass=%s).",
+                symbol, param.exchange, param.tradingClass)
 
-    expiries = _select_expiries(list(all_expiries))
+    expiries = _select_expiries(list(param.expirations))
     if not expiries:
         logger.warning("[%s] Aucune maturité future.", symbol)
         return pd.DataFrame()
@@ -162,40 +282,52 @@ def fetch_symbol(
         if T <= 0:
             continue
 
-        lo, hi = _strike_window(spot, T)
-        strikes_ok = sorted(k for k in all_strikes if lo <= k <= hi)
-        if not strikes_ok:
-            logger.debug("[%s %s] Aucun strike dans la fenêtre (%.0f–%.0f).", symbol, expiry, lo, hi)
+        # Contrats réellement existants pour cette échéance (déjà qualifiés)
+        contracts = _valid_contracts_for_expiry(
+            ib, symbol, expiry,
+            exchange=param.exchange,
+            trading_class=param.tradingClass,
+            currency=underlying.currency,
+        )
+        if not contracts:
+            logger.debug("[%s %s] Aucun contrat coté.", symbol, expiry)
             continue
 
-        contracts = [
-            _make_option(symbol, expiry, strike, right)
-            for strike in strikes_ok
-            for right in ("C", "P")
-        ]
+        # Pré-filtrage par fenêtre de strikes (≈ |delta| ≤ 0.30)
+        lo, hi = _strike_window(spot, T)
+        contracts = [c for c in contracts if lo <= c.strike <= hi]
+        if not contracts:
+            logger.debug(
+                "[%s %s] Aucun strike dans la fenêtre (%.0f–%.0f).",
+                symbol, expiry, lo, hi,
+            )
+            continue
+
+        logger.info("[%s %s] %d contrats dans la fenêtre.", symbol, expiry, len(contracts))
 
         # Lots de _BATCH_SIZE contrats
         for i in range(0, len(contracts), _BATCH_SIZE):
             batch = contracts[i : i + _BATCH_SIZE]
-            if not batch:
-                continue
 
-            try:
-                qualified_batch = ib.qualifyContracts(*batch)
-            except Exception as exc:
-                logger.warning("[%s %s] qualifyContracts batch échoué : %s", symbol, expiry, exc)
-                continue
-
-            tickers = [ib.reqMktData(c, "", False, False) for c in qualified_batch]
+            tickers = [ib.reqMktData(c, "", False, False) for c in batch]
             ib.sleep(_SLEEP_SECS)
 
-            for c, ticker in zip(qualified_batch, tickers):
+            for c, ticker in zip(batch, tickers):
                 try:
-                    bid  = float(ticker.bid)  if ticker.bid  not in (None, -1) else math.nan
-                    ask  = float(ticker.ask)  if ticker.ask  not in (None, -1) else math.nan
-                    last = float(ticker.last) if ticker.last not in (None, -1) else math.nan
+                    def _f(x) -> float:
+                        return float(x) if x is not None and x == x and x > 0 else math.nan
 
-                    mid = (bid + ask) / 2.0 if (math.isfinite(bid) and math.isfinite(ask)) else last
+                    bid  = _f(ticker.bid)
+                    ask  = _f(ticker.ask)
+                    last = _f(ticker.last)
+                    close = _f(ticker.close)
+
+                    if math.isfinite(bid) and math.isfinite(ask):
+                        mid = (bid + ask) / 2.0
+                    elif math.isfinite(last):
+                        mid = last
+                    else:
+                        mid = close   # dernier recours en données différées-figées
 
                     ib.cancelMktData(c)
 
@@ -232,7 +364,7 @@ def fetch_symbol(
             right=row["Type"], multiplier=multiplier,
         )
 
-        if not (SETTINGS.DELTA_MIN <= g["Delta"] <= SETTINGS.DELTA_MAX):
+        if not _in_delta_band(g["Delta"], row["Type"], q, row["T"]):
             continue
 
         records.append({
@@ -254,7 +386,7 @@ def fetch_symbol(
         })
 
     result = pd.DataFrame(records)
-    logger.info("[%s] %d lignes après filtre delta ±30%%.", symbol, len(result))
+    logger.info("[%s] %d lignes dans la bande [put 30Δ, call 30Δ].", symbol, len(result))
     return result
 
 

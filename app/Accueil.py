@@ -86,68 +86,70 @@ for k in all_strikes:
         return float(series[col]) if col in series.index and pd.notna(series[col]) else float("nan")
 
     rows.append({
-        "C Bid":  _get(c, "Bid"),
-        "C Ask":  _get(c, "Ask"),
-        "C Mid":  _get(c, "Mid"),
-        "C IV %": _get(c, "ImpliedVol") * 100 if not c.empty else float("nan"),
-        "C Δ":    _get(c, "Delta"),
-        "C Γ":    _get(c, "Gamma"),
-        "C V":    _get(c, "Vega"),
-        "C Θ":    _get(c, "Theta"),
+        "Bid C":  _get(c, "Bid"),
+        "Ask C":  _get(c, "Ask"),
+        "Mid C":  _get(c, "Mid"),
+        "IV C %": _get(c, "ImpliedVol") * 100 if not c.empty else float("nan"),
+        "Δ C":    _get(c, "Delta"),
+        "Γ C":    _get(c, "Gamma"),
+        "V C":    _get(c, "Vega"),
+        "Θ C":    _get(c, "Theta"),
         "Strike": k,
         "_atm":   k == atm_strike,
-        "P Bid":  _get(p, "Bid"),
-        "P Ask":  _get(p, "Ask"),
-        "P Mid":  _get(p, "Mid"),
-        "P IV %": _get(p, "ImpliedVol") * 100 if not p.empty else float("nan"),
-        "P Δ":    _get(p, "Delta"),
-        "P Γ":    _get(p, "Gamma"),
-        "P V":    _get(p, "Vega"),
-        "P Θ":    _get(p, "Theta"),
+        "Bid P":  _get(p, "Bid"),
+        "Ask P":  _get(p, "Ask"),
+        "Mid P":  _get(p, "Mid"),
+        "IV P %": _get(p, "ImpliedVol") * 100 if not p.empty else float("nan"),
+        "Δ P":    _get(p, "Delta"),
+        "Γ P":    _get(p, "Gamma"),
+        "V P":    _get(p, "Vega"),
+        "Θ P":    _get(p, "Theta"),
     })
 
-chain_df = pd.DataFrame(rows)
+chain_df   = pd.DataFrame(rows)
 display_df = chain_df.drop(columns=["_atm"])
+atm_flags  = chain_df["_atm"].values
 
-atm_flags = chain_df["_atm"].values
+# ── style ──────────────────────────────────────────────────────────────────────
+# Formats numériques appliqués via le Styler (et non column_config :
+# le mélange Styler + NumberColumn provoquait un affichage tronqué du
+# Gamma, ex. "056044" au lieu de "0.0560").
+_FMT = {
+    "Strike": "{:.0f}",
+    "Bid C": "{:.2f}", "Ask C": "{:.2f}", "Mid C": "{:.2f}",
+    "Bid P": "{:.2f}", "Ask P": "{:.2f}", "Mid P": "{:.2f}",
+    "IV C %": "{:.1f}", "IV P %": "{:.1f}",
+    "Δ C": "{:.4f}",   "Δ P": "{:.4f}",
+    "Γ C": "{:.4f}",   "Γ P": "{:.4f}",
+    "V C": "{:.2f}",   "V P": "{:.2f}",
+    "Θ C": "{:.2f}",   "Θ P": "{:.2f}",
+}
+
+_ATM_STYLE = "background-color: #5c4d00; color: #ffe97f; font-weight: bold"
+_STRIKE_STYLE = "font-weight: bold"
 
 
 def _highlight(row):
-    return (
-        ["background-color: #fffacd; font-weight: bold"] * len(row)
-        if atm_flags[row.name]
-        else [""] * len(row)
-    )
+    """Ligne ATM : fond ambre + texte clair (lisible sur thème sombre)."""
+    if atm_flags[row.name]:
+        return [_ATM_STYLE] * len(row)
+    return [_STRIKE_STYLE if col == "Strike" else "" for col in row.index]
 
 
-styled = display_df.style.apply(_highlight, axis=1)
+styled = (
+    display_df.style
+    .apply(_highlight, axis=1)
+    .format(_FMT, na_rep="")        # cellules vides au lieu de None/NaN
+)
 
 st.dataframe(
     styled,
     use_container_width=True,
     height=600,
-    column_config={
-        "Strike":  st.column_config.NumberColumn("Strike", format="%.0f"),
-        "C Bid":   st.column_config.NumberColumn("Bid C",  format="%.2f"),
-        "C Ask":   st.column_config.NumberColumn("Ask C",  format="%.2f"),
-        "C Mid":   st.column_config.NumberColumn("Mid C",  format="%.2f"),
-        "C IV %":  st.column_config.NumberColumn("IV C %", format="%.1f"),
-        "C Δ":     st.column_config.NumberColumn("Δ C",    format="%.4f"),
-        "C Γ":     st.column_config.NumberColumn("Γ C",    format="%.6f"),
-        "C V":     st.column_config.NumberColumn("V C",    format="%.2f"),
-        "C Θ":     st.column_config.NumberColumn("Θ C",    format="%.2f"),
-        "P Bid":   st.column_config.NumberColumn("Bid P",  format="%.2f"),
-        "P Ask":   st.column_config.NumberColumn("Ask P",  format="%.2f"),
-        "P Mid":   st.column_config.NumberColumn("Mid P",  format="%.2f"),
-        "P IV %":  st.column_config.NumberColumn("IV P %", format="%.1f"),
-        "P Δ":     st.column_config.NumberColumn("Δ P",    format="%.4f"),
-        "P Γ":     st.column_config.NumberColumn("Γ P",    format="%.6f"),
-        "P V":     st.column_config.NumberColumn("V P",    format="%.2f"),
-        "P Θ":     st.column_config.NumberColumn("Θ P",    format="%.2f"),
-    },
 )
 
 st.caption(
     "IV en % | Vega par 1% de vol | Theta par jour calendaire | "
-    "Strike ATM surligné en jaune | Delta filtré ±30%"
+    "Strike ATM surligné | Delta filtré ±30% (seules les options OTM "
+    "apparaissent : puts sous le spot, calls au-dessus)"
 )
