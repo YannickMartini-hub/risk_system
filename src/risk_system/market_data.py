@@ -11,6 +11,7 @@ import math
 from datetime import datetime, date
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -19,6 +20,34 @@ from .greeks import all_greeks
 from .implied_vol import implied_vol
 
 logger = logging.getLogger(__name__)
+
+
+class _SuppressDelayedDataFallback(logging.Filter):
+    """
+    Supprime les codes IBKR 10090 et 10167 qui signalent simplement que
+    les données différées sont utilisées à la place du temps réel.
+    Ces messages sont attendus dès que _MARKET_DATA_TYPE = 3 et qu'il
+    n'y a pas d'abonnement temps réel — les logger comme ERROR est trompeur.
+    """
+    _CODES = {"10090", "10167"}
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return not any(
+            f"Error {c}," in msg or f"Warning {c}," in msg
+            for c in self._CODES
+        )
+
+
+def _install_ibkr_log_filter() -> None:
+    """Installe le filtre sur les loggers ib_insync (idempotent)."""
+    _filter = _SuppressDelayedDataFallback()
+    for name in ("ib_insync.wrapper", "ib_insync.ib", "ib_insync"):
+        lg = logging.getLogger(name)
+        # Évite les doublons si la fonction est appelée plusieurs fois
+        if not any(isinstance(f, _SuppressDelayedDataFallback) for f in lg.filters):
+            lg.addFilter(_filter)
+
 
 # ── constantes de configuration ───────────────────────────────────────────────
 # Maturités cibles (jours calendaires) : 2 semaines → 36 mois
@@ -32,6 +61,15 @@ _SLEEP_SECS = 2.0     # pause après chaque lot (respect des limites IB)
 # 1 = temps réel (abonnement requis), 3 = différé, 4 = différé-figé.
 # 3 retombe automatiquement sur le temps réel si l'abonnement existe.
 _MARKET_DATA_TYPE = 3
+
+_CET = ZoneInfo("Europe/Berlin")  # CET/CEST selon la saison
+
+
+def _in_eurex_hours() -> bool:
+    """True si on est dans les heures de trading EUREX (lun-ven, 09h-22h CET)."""
+    now = datetime.now(tz=_CET)
+    return now.weekday() < 5 and 9 <= now.hour < 22
+
 
 
 # ── helpers de conversion ─────────────────────────────────────────────────────
@@ -189,6 +227,8 @@ def fetch_symbol(
     q = q if q is not None else SETTINGS.q
     multiplier = SETTINGS.MULTIPLIER if symbol == "SX5E" else 1
 
+    # Supprime le bruit 10090/10167 (fallback données différées — attendu).
+    _install_ibkr_log_filter()
     # Données différées si pas d'abonnement temps réel (idempotent).
     ib.reqMarketDataType(_MARKET_DATA_TYPE)
 
@@ -248,12 +288,25 @@ def fetch_symbol(
     # ── 3. boucle sur les maturités ────────────────────────────────────────
     raw_rows: list[dict] = []
 
+    if _in_eurex_hours():
+        logger.info("[%s] EUREX ouvert — bid/ask live.", symbol)
+    else:
+        logger.info("[%s] Hors heures EUREX — fallback sur close du jour.", symbol)
+
+    def _f(x) -> float:
+        return float(x) if x is not None and x == x and x > 0 else math.nan
+
+    def _fvol(x) -> float:
+        if x is None or x != x:
+            return math.nan
+        v = float(x)
+        return v if v >= 0 else math.nan
+
     for expiry in expiries:
         T = _expiry_to_T(expiry)
         if T <= 0:
             continue
 
-        # Contrats réellement existants pour cette échéance (déjà qualifiés)
         contracts = _valid_contracts_for_expiry(
             ib, symbol, expiry,
             exchange=param.exchange,
@@ -264,65 +317,50 @@ def fetch_symbol(
             logger.debug("[%s %s] Aucun contrat coté.", symbol, expiry)
             continue
 
-        logger.info("[%s %s] %d contrats disponibles.", symbol, expiry, len(contracts))
+        logger.info("[%s %s] %d contrats.", symbol, expiry, len(contracts))
 
-        # Lots de _BATCH_SIZE contrats
         for i in range(0, len(contracts), _BATCH_SIZE):
             batch = contracts[i : i + _BATCH_SIZE]
-
             tickers = [ib.reqMktData(c, "", False, False) for c in batch]
             ib.sleep(_SLEEP_SECS)
 
             for c, ticker in zip(batch, tickers):
                 try:
-                    def _f(x) -> float:
-                        return float(x) if x is not None and x == x and x > 0 else math.nan
-
-                    def _fvol(x) -> float:
-                        # Volume : 0 est valide, négatif/NaN → NaN
-                        if x is None or x != x:
-                            return math.nan
-                        v = float(x)
-                        return v if v >= 0 else math.nan
-
-                    bid   = _f(ticker.bid)
-                    ask   = _f(ticker.ask)
-                    last  = _f(ticker.last)
-                    close = _f(ticker.close)
+                    bid    = _f(ticker.bid)
+                    ask    = _f(ticker.ask)
+                    last   = _f(ticker.last)
+                    close  = _f(ticker.close)
                     volume = _fvol(ticker.volume)
-
-                    if math.isfinite(bid) and math.isfinite(ask):
-                        mid = (bid + ask) / 2.0
-                    elif math.isfinite(last):
-                        mid = last
-                    else:
-                        mid = close   # dernier recours en données différées-figées
 
                     ib.cancelMktData(c)
 
-                    if not math.isfinite(mid) or mid <= 0:
+                    if math.isfinite(bid) and math.isfinite(ask) and bid > 0 and ask > bid:
+                        mid = (bid + ask) / 2.0
+                        if (ask - bid) / mid > 1.0:   # spread > 100% → illiquide
+                            continue
+                    elif math.isfinite(last) and last > 0:
+                        mid = last
+                    elif math.isfinite(close) and close > 0:
+                        mid = close   # prix de clôture EUREX du jour
+                    else:
                         continue
 
                     raw_rows.append({
-                        "Symbol":   symbol,
-                        "Spot":     spot,
+                        "Symbol":   symbol, "Spot":  spot,
                         "Strike":   float(c.strike),
-                        "Maturity": _expiry_to_iso(expiry),
-                        "T":        T,
+                        "Maturity": _expiry_to_iso(expiry), "T": T,
                         "Type":     c.right,
-                        "Bid":      bid,
-                        "Ask":      ask,
-                        "Mid":      mid,
-                        "Volume":   volume,
+                        "Bid":      bid,    "Ask":   ask,
+                        "Mid":      mid,    "Volume": volume,
                     })
                 except Exception as exc:
-                    logger.debug("[%s] Erreur lecture ticker %s : %s", symbol, c, exc)
+                    logger.debug("[%s] Ticker %s : %s", symbol, c, exc)
 
     if not raw_rows:
         logger.warning("[%s] Aucun prix collecté.", symbol)
         return pd.DataFrame()
 
-    # ── 4. IV + grecs + filtre delta ──────────────────────────────────────
+    # ── 4. IV + grecs (tous les strikes avec prix valide) ────────────────
     records: list[dict] = []
     for row in raw_rows:
         iv = implied_vol(row["Spot"], row["Strike"], row["T"], r, q, row["Mid"], row["Type"])
@@ -335,26 +373,30 @@ def fetch_symbol(
         )
 
         records.append({
-            "Symbol":     row["Symbol"],
-            "Spot":       row["Spot"],
-            "Strike":     row["Strike"],
-            "Maturity":   row["Maturity"],
-            "T":          row["T"],
-            "Type":       row["Type"],
-            "Bid":        row["Bid"],
-            "Ask":        row["Ask"],
-            "Mid":        row["Mid"],
-            "Volume":     row["Volume"],
-            "ImpliedVol": iv,
-            "Delta":      g["Delta"],
-            "Gamma":      g["Gamma"],
-            "Vega":       g["Vega"],
-            "Theta":      g["Theta"],
-            "Rho":        g["Rho"],
+            "Symbol":      row["Symbol"],
+            "Spot":        row["Spot"],
+            "Strike":      row["Strike"],
+            "Maturity":    row["Maturity"],
+            "T":           row["T"],
+            "Type":        row["Type"],
+            "Bid":         row["Bid"],
+            "Ask":         row["Ask"],
+            "Mid":         row["Mid"],
+            "Volume":      row["Volume"],
+            "ImpliedVol":  iv,
+            "Delta":       g["Delta"],
+            "Gamma":       g["Gamma"],
+            "Vega":        g["Vega"],
+            "Theta":       g["Theta"],
+            "Rho":         g["Rho"],
+            "DollarDelta": g["Delta"] * row["Spot"] * multiplier,
+            "DollarGamma": g["DollarGamma"],
+            "DollarVega":  g["DollarVega"],
+            "DollarTheta": g["Theta"] * multiplier,
         })
 
     result = pd.DataFrame(records)
-    logger.info("[%s] %d lignes collectées (tous strikes).", symbol, len(result))
+    logger.info("[%s] %d lignes collectées (tous strikes avec IV valide).", symbol, len(result))
     return result
 
 

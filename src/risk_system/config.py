@@ -25,9 +25,10 @@ class Settings:
     r: float = 0.025
     q: float = 0.0
 
-    # ── filtre delta ──────────────────────────────────────────────────────
-    DELTA_MIN: float = -0.30
-    DELTA_MAX: float = 0.30
+    # ── filtre delta : borne basse = ATM − 30Δ, borne haute = ATM + 30Δ ──
+    # En valeur absolue : 0.20 ≤ |Δ| ≤ 0.80 (calls et puts)
+    DELTA_ABS_MIN: float = 0.20
+    DELTA_ABS_MAX: float = 0.80
 
     # ── SX5E (Eurex) ──────────────────────────────────────────────────────
     MULTIPLIER: int = 10

@@ -10,6 +10,7 @@ import math
 import numpy as np
 import pandas as pd
 from scipy.interpolate import griddata
+from scipy.ndimage import gaussian_filter
 
 
 def build_surface(
@@ -40,6 +41,9 @@ def build_surface(
     Lève ValueError si moins de 4 points valides pour le symbole.
     """
     sub = df[df["Symbol"] == symbol].dropna(subset=["ImpliedVol", "T", "Strike", "Spot"])
+
+    # Supprime les IV aberrantes dues aux données IBKR bruitées
+    sub = sub[(sub["ImpliedVol"] >= 0.02) & (sub["ImpliedVol"] <= 1.50)]
 
     if len(sub) < 4:
         raise ValueError(
@@ -74,6 +78,9 @@ def build_surface(
 
     # Clamp variance totale ≥ 0 (pas de vol implicite négative)
     W = np.clip(W, 1e-8, None)
+
+    # Lissage gaussien pour atténuer les artefacts d'interpolation
+    W = gaussian_filter(W, sigma=1.0)
 
     # Reconversion : σ = √(w / T), T sécurisé contre la division par zéro
     T_safe = np.where(Y > 1e-6, Y, 1e-6)

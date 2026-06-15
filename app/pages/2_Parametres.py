@@ -10,6 +10,7 @@ Les paramètres sont stockés dans st.session_state pour les autres pages.
 from __future__ import annotations
 
 import sys
+from datetime import date as _date
 from pathlib import Path
 
 import pandas as pd
@@ -21,6 +22,25 @@ from risk_system.implied_vol import implied_vol
 from risk_system.greeks import all_greeks
 from risk_system.market_data import list_snapshots
 from risk_system.config import SETTINGS
+
+_TENORS = [("1w", 7), ("2w", 14), ("1m", 30), ("2m", 60), ("3m", 91),
+           ("4m", 122), ("6m", 182), ("9m", 273), ("1y", 365), ("18m", 548), ("2y", 730)]
+
+
+def _tenor_label(mat_str: str) -> str:
+    days = (_date.fromisoformat(mat_str) - _date.today()).days
+    if days <= 0:
+        return mat_str
+    return min(_TENORS, key=lambda x: abs(x[1] - days))[0]
+
+
+def _maturity_options(maturities: list[str]) -> list[tuple[str, str]]:
+    labeled = [(mat, _tenor_label(mat)) for mat in maturities]
+    counts: dict[str, int] = {}
+    for _, lbl in labeled:
+        counts[lbl] = counts.get(lbl, 0) + 1
+    return [(f"{lbl} ({mat})", mat) if counts[lbl] > 1 else (lbl, mat)
+            for mat, lbl in labeled]
 
 st.set_page_config(page_title="Risk System — Paramètres", layout="wide")
 st.title("Paramètres de marché & Recalcul")
@@ -47,8 +67,12 @@ df_raw = _load(str(selected_path))
 symbols    = sorted(df_raw["Symbol"].unique())
 symbol     = st.sidebar.selectbox("Sous-jacent", symbols)
 df_sym     = df_raw[df_raw["Symbol"] == symbol]
-maturities = sorted(df_sym["Maturity"].unique())
-maturity   = st.sidebar.selectbox("Maturité", maturities)
+maturities  = sorted(df_sym["Maturity"].unique())
+mat_opts    = _maturity_options(maturities)
+mat_labels  = [lbl for lbl, _ in mat_opts]
+mat_dates   = [dt  for _, dt  in mat_opts]
+mat_label   = st.sidebar.selectbox("Maturité", mat_labels)
+maturity    = mat_dates[mat_labels.index(mat_label)]
 
 # ── paramètres ────────────────────────────────────────────────────────────────
 st.header("Paramètres de calcul")
@@ -84,7 +108,7 @@ st.session_state["day_base"] = day_base
 st.caption(f"r = **{r*100:.2f}%**  |  q = **{q*100:.2f}%**  |  base theta = **{day_base} j/an**")
 
 # ── recalcul ──────────────────────────────────────────────────────────────────
-st.header(f"Options recalculées — {symbol} / {maturity}")
+st.header(f"Options recalculées — {symbol} / {mat_label}")
 
 df = df_sym[df_sym["Maturity"] == maturity].copy()
 if df.empty:

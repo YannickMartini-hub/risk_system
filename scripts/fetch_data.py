@@ -88,6 +88,8 @@ def main() -> None:
             df = fetch_symbol(ib, symbol, max_expiries=args.expiries_max)
             if not df.empty:
                 frames.append(df)
+    except KeyboardInterrupt:
+        logger.warning("Interruption utilisateur — arrêt propre.")
     finally:
         ib.disconnect()
         logger.info("Déconnecté de IBKR.")
