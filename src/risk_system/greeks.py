@@ -10,10 +10,15 @@ Conventions :
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import Optional
 
+import pandas as pd
+
 from .pricing import norm_cdf, norm_pdf, compute_d1, compute_d2
+
+logger = logging.getLogger(__name__)
 
 
 # ── grecs scalaires ──────────────────────────────────────────────────────────
@@ -100,7 +105,7 @@ def dollar_gamma(
     Dollar Gamma (Eq. 17) : gamma monétisé.
     DollarGamma = Γ * S² * multiplier
 
-    Pour SX5E options Eurex : multiplier = 10.
+    Pour SPX/US stocks : multiplier = 100.
     """
     return gamma(S, K, T, r, q, sigma) * S ** 2 * multiplier
 
@@ -186,3 +191,57 @@ def all_greeks(
         "DollarGamma": dollar_gamma(S, K, T, r, q, sigma, multiplier),
         "DollarVega":  dollar_vega(S, K, T, r, q, sigma, multiplier),
     }
+
+
+def aggregate_greeks(
+    positions: list[dict],
+    snapshot: pd.DataFrame,
+    multiplier: int = 100,
+) -> dict:
+    """
+    Agrège les greeks dollar d'un portefeuille d'options depuis un snapshot.
+
+    Paramètres
+    ----------
+    positions : liste de dicts, chacun avec les clés :
+        symbol   : str  — ex. 'SPX'
+        strike   : float — ex. 5500.0
+        maturity : str  — ex. '2026-09-19' (format YYYY-MM-DD)
+        type     : str  — 'C' ou 'P'
+        quantity : int  — nombre de contrats (positif = long, négatif = short)
+    snapshot  : DataFrame chargé depuis load_latest_snapshot()
+    multiplier: non utilisé directement (les greeks dollar sont déjà dans le snapshot)
+
+    Retourne
+    --------
+    dict {'DollarDelta', 'DollarGamma', 'DollarVega', 'DollarTheta'}
+    Retourne des zéros si aucune position n'est trouvée dans le snapshot.
+    """
+    totals: dict[str, float] = {
+        "DollarDelta": 0.0,
+        "DollarGamma": 0.0,
+        "DollarVega":  0.0,
+        "DollarTheta": 0.0,
+    }
+
+    if snapshot.empty:
+        logger.warning("aggregate_greeks: snapshot vide.")
+        return totals
+
+    for pos in positions:
+        mask = (
+            (snapshot["Symbol"]   == pos["symbol"]) &
+            (snapshot["Strike"]   == float(pos["strike"])) &
+            (snapshot["Maturity"] == pos["maturity"]) &
+            (snapshot["Type"]     == pos["type"])
+        )
+        rows = snapshot[mask]
+        if rows.empty:
+            logger.warning("aggregate_greeks: position introuvable : %s", pos)
+            continue
+        row = rows.iloc[0]
+        qty = int(pos["quantity"])
+        for col in totals:
+            totals[col] += float(row[col]) * qty
+
+    return totals

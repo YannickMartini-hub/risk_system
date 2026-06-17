@@ -22,7 +22,7 @@ class Settings:
     client_id: int = 1
 
     # ── paramètres de marché par défaut ───────────────────────────────────
-    r: float = 0.025
+    r: float = 0.045   # taux US (Fed funds / 10Y ~ 4.5%)
     q: float = 0.0
 
     # ── filtre delta : borne basse = ATM − 30Δ, borne haute = ATM + 30Δ ──
@@ -30,8 +30,8 @@ class Settings:
     DELTA_ABS_MIN: float = 0.20
     DELTA_ABS_MAX: float = 0.80
 
-    # ── SX5E (Eurex) ──────────────────────────────────────────────────────
-    MULTIPLIER: int = 10
+    # ── SPX (CBOE, mult=100) ──────────────────────────────────────────────
+    MULTIPLIER: int = 100
 
     # ── conventions de temps ──────────────────────────────────────────────
     T_BASIS: float = 365.25   # ACT/365.25 pour annualiser T
@@ -42,7 +42,7 @@ class Settings:
     parquet_dir: Path = field(default_factory=lambda: _ROOT / "data" / "parquet")
     reference_dir: Path = field(default_factory=lambda: _ROOT / "data" / "reference")
     tickers_file: Path = field(
-        default_factory=lambda: _ROOT / "data" / "reference" / "euro_stoxx_50_tickers.xlsx"
+        default_factory=lambda: _ROOT / "data" / "reference" / "sp500_top50_universe.xlsx"
     )
 
     def __post_init__(self) -> None:

@@ -2,7 +2,8 @@
 Page 1 — Option Chain (Prix du marché).
 
 Tableau style salle de marché : Calls | Strike | Puts
-avec volume, IV, grecs en valeur et en €.
+avec volume, IV, grecs en valeur et en $.
+Filtre delta : 0.20 ≤ |Δ| ≤ 0.80 (ATM inclus, deep OTM exclus).
 Lit le dernier snapshot Parquet disponible — aucune connexion IBKR.
 """
 
@@ -17,6 +18,7 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from risk_system.config import SETTINGS
 from risk_system.market_data import list_snapshots
 
 _TENORS = [("1w", 7), ("2w", 14), ("1m", 30), ("2m", 60), ("3m", 91),
@@ -81,6 +83,11 @@ maturity    = mat_dates[mat_labels.index(mat_label)]
 
 df = df_sym[df_sym["Maturity"] == maturity].copy()
 
+# ── filtre delta : 0.20 ≤ |Δ| ≤ 0.80 (ATM inclus, deep OTM exclus) ──────────
+if "Delta" in df.columns and not df.empty:
+    delta_abs = df["Delta"].abs()
+    df = df[delta_abs.between(SETTINGS.DELTA_ABS_MIN, SETTINGS.DELTA_ABS_MAX)]
+
 # ── en-tête ───────────────────────────────────────────────────────────────────
 spot_val = float(df["Spot"].iloc[0]) if not df.empty else 0.0
 T_val    = float(df["T"].iloc[0])    if not df.empty else 0.0
@@ -88,11 +95,12 @@ T_val    = float(df["T"].iloc[0])    if not df.empty else 0.0
 st.title(f"Option Chain — {symbol}")
 st.caption(
     f"Spot : **{spot_val:,.2f}** | Maturité : **{mat_label}** ({maturity}) | "
-    f"T : **{T_val:.4f} an** | Snapshot : `{selected_name}`"
+    f"T : **{T_val:.4f} an** | Snapshot : `{selected_name}` | "
+    f"Filtre Δ : **{SETTINGS.DELTA_ABS_MIN:.2f} – {SETTINGS.DELTA_ABS_MAX:.2f}**"
 )
 
 if df.empty:
-    st.info("Aucune donnée pour cette sélection.")
+    st.info("Aucune donnée pour cette sélection (filtre delta peut-être trop strict).")
     st.stop()
 
 # ── construction du tableau option chain ──────────────────────────────────────
@@ -125,10 +133,10 @@ for k in all_strikes:
         "Γ C":     _get(c, "Gamma"),
         "V C":     _get(c, "Vega"),
         "Θ C":     _get(c, "Theta"),
-        "€Δ C":    _get(c, "DollarDelta"),
-        "€Γ C":    _get(c, "DollarGamma"),
-        "€V C":    _get(c, "DollarVega"),
-        "€Θ C":    _get(c, "DollarTheta"),
+        "$Δ C":    _get(c, "DollarDelta"),
+        "$Γ C":    _get(c, "DollarGamma"),
+        "$V C":    _get(c, "DollarVega"),
+        "$Θ C":    _get(c, "DollarTheta"),
         # ── STRIKE ───────────────────────────────────────────────────────
         "Strike":  k,
         "_atm":    k == atm_strike,
@@ -142,10 +150,10 @@ for k in all_strikes:
         "Γ P":     _get(p, "Gamma"),
         "V P":     _get(p, "Vega"),
         "Θ P":     _get(p, "Theta"),
-        "€Δ P":    _get(p, "DollarDelta"),
-        "€Γ P":    _get(p, "DollarGamma"),
-        "€V P":    _get(p, "DollarVega"),
-        "€Θ P":    _get(p, "DollarTheta"),
+        "$Δ P":    _get(p, "DollarDelta"),
+        "$Γ P":    _get(p, "DollarGamma"),
+        "$V P":    _get(p, "DollarVega"),
+        "$Θ P":    _get(p, "DollarTheta"),
     })
 
 chain_df  = pd.DataFrame(rows)
@@ -169,11 +177,11 @@ _FMT = {
     "Γ C":    "{:.6f}",   "Γ P":    "{:.6f}",
     "V C":    "{:.2f}",   "V P":    "{:.2f}",
     "Θ C":    "{:.2f}",   "Θ P":    "{:.2f}",
-    # grecs en €
-    "€Δ C":   "{:.0f}",   "€Δ P":   "{:.0f}",
-    "€Γ C":   "{:.2f}",   "€Γ P":   "{:.2f}",
-    "€V C":   "{:.2f}",   "€V P":   "{:.2f}",
-    "€Θ C":   "{:.2f}",   "€Θ P":   "{:.2f}",
+    # grecs en $
+    "$Δ C":   "{:.0f}",   "$Δ P":   "{:.0f}",
+    "$Γ C":   "{:.2f}",   "$Γ P":   "{:.2f}",
+    "$V C":   "{:.2f}",   "$V P":   "{:.2f}",
+    "$Θ C":   "{:.2f}",   "$Θ P":   "{:.2f}",
 }
 
 _ATM_STYLE    = "background-color: #5c4d00; color: #ffe97f; font-weight: bold"
@@ -207,7 +215,7 @@ st.dataframe(
 st.caption(
     "**Grecs en valeur** : Δ (sans unité) | Γ (par point²) | "
     "Vega (par 1% de vol) | Θ (par jour cal.) — "
-    "**Grecs en €** : €Δ = Δ × Spot × mult | €Γ = Γ × Spot² × mult | "
-    "€Vega = Vega × mult | €Θ = Θ × mult — "
-    "Strike ATM surligné"
+    "**Grecs en $** : $Δ = Δ × Spot × mult | $Γ = Γ × Spot² × mult | "
+    "$Vega = Vega × mult | $Θ = Θ × mult — "
+    "Strike ATM surligné | mult = 100 (SPX / actions US)"
 )

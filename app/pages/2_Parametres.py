@@ -80,7 +80,7 @@ col1, col2, col3 = st.columns(3)
 
 with col1:
     r_pct = st.slider(
-        "Taux sans risque r (%)", 0.0, 10.0,
+        "Taux sans risque US r (%)", 0.0, 10.0,
         float(st.session_state.get("r", SETTINGS.r)) * 100,
         step=0.1,
     )
@@ -115,7 +115,7 @@ if df.empty:
     st.info("Aucune option pour cette sélection.")
     st.stop()
 
-multiplier = SETTINGS.MULTIPLIER if symbol == "SX5E" else 1
+multiplier = SETTINGS.MULTIPLIER  # 100 pour SPX et actions US
 results: list[dict] = []
 
 for _, row in df.iterrows():

@@ -1,6 +1,7 @@
 """
 Construction de la nappe de volatilité implicite.
 Interpolation en variance totale w = σ²T (meilleure régularité analytique).
+Log-moneyness forward-based : k = ln(K/F) où F est le forward par parité put-call.
 """
 
 from __future__ import annotations
@@ -29,14 +30,15 @@ def build_surface(
     Paramètres
     ----------
     df     : DataFrame avec colonnes Symbol, Spot, Strike, T, ImpliedVol
+             et optionnellement Forward (si absent, fallback sur Spot)
     symbol : sous-jacent à filtrer
     n_grid : résolution de la grille régulière (n_grid × n_grid)
 
     Retourne
     --------
-    X : grille de log-moneyness  (n_grid × n_grid)
-    Y : grille de maturités      (n_grid × n_grid)
-    Z : grille de vol implicite  (n_grid × n_grid, en décimal)
+    X : grille de log-moneyness k=ln(K/F)  (n_grid × n_grid)
+    Y : grille de maturités en années       (n_grid × n_grid)
+    Z : grille de vol implicite en décimal  (n_grid × n_grid)
 
     Lève ValueError si moins de 4 points valides pour le symbole.
     """
@@ -51,8 +53,10 @@ def build_surface(
             f"({len(sub)} point(s) trouvé(s), minimum 4)."
         )
 
-    # Log-moneyness relatif au spot (approximation du forward)
-    k_vals = np.log(sub["Strike"].values / sub["Spot"].values)
+    # Log-moneyness forward-based k = ln(K/F)
+    # Fallback sur Spot si Forward absent (anciens snapshots SX5E)
+    fwd = sub["Forward"].values if "Forward" in sub.columns else sub["Spot"].values
+    k_vals = np.log(sub["Strike"].values / fwd)
     t_vals = sub["T"].values.astype(float)
     # Variance totale : w = σ²T
     w_vals = sub["ImpliedVol"].values.astype(float) ** 2 * t_vals

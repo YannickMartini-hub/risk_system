@@ -3,10 +3,10 @@
 Extrait les données d'options depuis Interactive Brokers et sauvegarde un snapshot Parquet.
 
 Usage :
-    python scripts/fetch_data.py                         # tous les symboles
-    python scripts/fetch_data.py --symbols SX5E AIR ALV  # symboles spécifiques
-    python scripts/fetch_data.py --expiries-max 4        # limite le nombre de maturités
-    python scripts/fetch_data.py --dry-run               # sans connexion IBKR
+    python scripts/fetch_data.py                          # tous les symboles (51)
+    python scripts/fetch_data.py --symbols SPX AAPL MSFT  # symboles spécifiques
+    python scripts/fetch_data.py --expiries-max 4         # limite le nombre de maturités
+    python scripts/fetch_data.py --dry-run                # sans connexion IBKR
 """
 
 from __future__ import annotations
@@ -32,9 +32,9 @@ logger = logging.getLogger("fetch_data")
 
 
 def _load_tickers() -> list[str]:
-    """Charge les tickers depuis le fichier Excel de référence (header=0 → colonne 'Sigle')."""
+    """Charge les tickers depuis sp500_top50_universe.xlsx (colonne 'Ticker')."""
     df = pd.read_excel(SETTINGS.tickers_file, header=0)
-    tickers = df.iloc[:, 0].dropna().astype(str).str.strip().tolist()
+    tickers = df["Ticker"].dropna().astype(str).str.strip().tolist()
     seen: dict[str, None] = {}
     for t in tickers:
         seen[t] = None
@@ -42,11 +42,11 @@ def _load_tickers() -> list[str]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Fetch option data from IBKR.")
+    parser = argparse.ArgumentParser(description="Fetch option data from IBKR (S&P 500 universe).")
     parser.add_argument(
         "--symbols", nargs="+", default=None,
         metavar="SYM",
-        help="Symboles à traiter (défaut : tous les tickers du fichier Excel + SX5E).",
+        help="Symboles à traiter (défaut : tous les tickers du fichier Excel).",
     )
     parser.add_argument(
         "--expiries-max", type=int, default=None,
@@ -59,13 +59,13 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    tickers = ["SX5E"] + [t for t in _load_tickers() if t != "SX5E"]
-    symbols: list[str] = args.symbols if args.symbols else tickers
+    symbols: list[str] = args.symbols if args.symbols else _load_tickers()
 
     if args.dry_run:
         logger.info("Dry-run — aucune connexion IBKR.")
         for s in symbols:
             logger.info("  À extraire : %s", s)
+        logger.info("Total : %d symboles.", len(symbols))
         return
 
     try:

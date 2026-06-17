@@ -1,5 +1,6 @@
 """
 Extraction des données de marché via Interactive Brokers (ib_insync).
+Univers : SPX (Index/CBOE) + top 50 S&P 500 (Stock/SMART/USD).
 Une seule connexion réutilisée pour tous les symboles.
 Aucun print : logging uniquement.
 """
@@ -44,7 +45,6 @@ def _install_ibkr_log_filter() -> None:
     _filter = _SuppressDelayedDataFallback()
     for name in ("ib_insync.wrapper", "ib_insync.ib", "ib_insync"):
         lg = logging.getLogger(name)
-        # Évite les doublons si la fonction est appelée plusieurs fois
         if not any(isinstance(f, _SuppressDelayedDataFallback) for f in lg.filters):
             lg.addFilter(_filter)
 
@@ -59,17 +59,21 @@ _SLEEP_SECS = 2.0     # pause après chaque lot (respect des limites IB)
 
 # Type de market data :
 # 1 = temps réel (abonnement requis), 3 = différé, 4 = différé-figé.
-# 3 retombe automatiquement sur le temps réel si l'abonnement existe.
 _MARKET_DATA_TYPE = 3
 
-_CET = ZoneInfo("Europe/Berlin")  # CET/CEST selon la saison
+_ET = ZoneInfo("America/New_York")
+
+# Mapping tickers → symbole IBKR (cas spéciaux)
+_IBKR_SYMBOL_MAP = {"BRK.B": "BRK B"}
 
 
-def _in_eurex_hours() -> bool:
-    """True si on est dans les heures de trading EUREX (lun-ven, 09h-22h CET)."""
-    now = datetime.now(tz=_CET)
-    return now.weekday() < 5 and 9 <= now.hour < 22
-
+def _in_us_hours() -> bool:
+    """True si on est dans les heures de trading US (lun-ven, 09h30-16h00 ET)."""
+    now = datetime.now(tz=_ET)
+    if now.weekday() >= 5:
+        return False
+    t = now.hour * 60 + now.minute
+    return 9 * 60 + 30 <= t < 16 * 60
 
 
 # ── helpers de conversion ─────────────────────────────────────────────────────
@@ -114,86 +118,74 @@ def _select_expiries(expirations: list[str]) -> list[str]:
 
 # ── construction des contrats IBKR ────────────────────────────────────────────
 
-_CURRENCIES = ("EUR", "CHF", "GBP", "USD")
-
-# Bourses dérivés européennes préférées pour la sonde d'options
-_PREFERRED_OPT_EXCHANGES = (
-    "EUREX", "MONEP", "FTA", "SOFFEX", "IDEM", "MEFFRV", "OMS", "DTB",
-)
-
-
-def _resolve_underlying(ib, symbol: str):
+def _resolve_underlying_us(ib, symbol: str):
     """
-    Résout le contrat sous-jacent.
-    Index Eurex pour SX5E ; sinon Stock en essayant plusieurs devises
-    (certains tickers de la liste ne cotent pas en EUR, ex: UBSG en CHF).
+    Résout le contrat sous-jacent pour l'univers S&P 500.
+    SPX → Index("SPX", "CBOE", "USD")
+    Stocks → Stock(ibkr_symbol, "SMART", "USD")
     Retourne le contrat qualifié, ou None.
     """
     from ib_insync import Index, Stock
 
-    if symbol == "SX5E":
-        qualified = ib.qualifyContracts(Index("ESTX50", "EUREX", "EUR"))
+    ibkr_sym = _IBKR_SYMBOL_MAP.get(symbol, symbol)
+
+    if symbol == "SPX":
+        qualified = ib.qualifyContracts(Index("SPX", "CBOE", "USD"))
         return qualified[0] if qualified else None
 
-    for ccy in _CURRENCIES:
-        try:
-            qualified = ib.qualifyContracts(Stock(symbol, "SMART", ccy))
-        except Exception:
-            qualified = []
-        if qualified:
-            if ccy != "EUR":
-                logger.info("[%s] Résolu en %s (pas EUR).", symbol, ccy)
-            return qualified[0]
+    try:
+        qualified = ib.qualifyContracts(Stock(ibkr_sym, "SMART", "USD"))
+    except Exception:
+        qualified = []
+    if qualified:
+        return qualified[0]
+    logger.warning("[%s] Contrat introuvable (SMART/USD).", symbol)
     return None
 
 
-def _select_option_param(params: list, symbol: str):
+def _select_option_param_us(params: list, symbol: str):
     """
-    Choisit l'entrée de reqSecDefOptParams à utiliser pour la sonde.
+    Choisit l'entrée de reqSecDefOptParams pour la sonde d'options.
 
-    Les options européennes ne sont pas SMART-routables : il faut
-    interroger la bourse dérivés native (MONEP, EUREX...). On préfère
-    donc une bourse connue, sinon la première entrée non-SMART,
-    sinon la première tout court.
+    SPX : préférer CBOE + tradingClass="SPX" (AM-settled mensuel standard).
+    Stocks : n'importe quelle exchange non-SMART (OCC), sinon la première.
     """
-    if symbol == "SX5E":
-        oesx = [p for p in params if p.tradingClass == "OESX"]
-        if oesx:
-            return oesx[0]
+    if symbol == "SPX":
+        spx_params = [p for p in params if p.exchange == "CBOE" and p.tradingClass == "SPX"]
+        if spx_params:
+            return spx_params[0]
+        cboe = [p for p in params if p.exchange == "CBOE"]
+        if cboe:
+            return cboe[0]
 
-    for exch in _PREFERRED_OPT_EXCHANGES:
-        for p in params:
-            if p.exchange == exch:
-                return p
     non_smart = [p for p in params if p.exchange != "SMART"]
     if non_smart:
         return non_smart[0]
     return params[0]
 
 
-def _valid_contracts_for_expiry(
+def _valid_contracts_for_expiry_us(
     ib, symbol: str, expiry: str, exchange: str, trading_class: str, currency: str,
 ) -> list:
     """
-    Récupère, en UNE requête, tous les contrats d'options réellement
-    existants pour (symbole, échéance) via reqContractDetails, sur la
-    bourse dérivés native du sous-jacent.
-
-    Les contrats retournés sont déjà entièrement qualifiés (conId inclus) :
-    plus besoin de qualifyContracts.
+    Récupère tous les contrats d'options réellement existants pour
+    (symbole, échéance) via reqContractDetails.
+    Les contrats retournés sont déjà qualifiés (conId inclus).
     """
     from ib_insync import Option
 
+    ibkr_sym = "SPX" if symbol == "SPX" else _IBKR_SYMBOL_MAP.get(symbol, symbol)
+
     probe = Option(
-        "ESTX50" if symbol == "SX5E" else symbol,
+        ibkr_sym,
         lastTradeDateOrContractMonth=expiry,
         exchange=exchange,
         currency=currency,
     )
+    if symbol == "SPX":
+        probe.multiplier = "100"
     if trading_class:
         probe.tradingClass = trading_class
-    if symbol == "SX5E":
-        probe.multiplier = "10"
 
     try:
         details = ib.reqContractDetails(probe)
@@ -201,6 +193,43 @@ def _valid_contracts_for_expiry(
         logger.warning("[%s %s] reqContractDetails échoué : %s", symbol, expiry, exc)
         return []
     return [d.contract for d in details]
+
+
+# ── calcul du forward par parité put-call ────────────────────────────────────
+
+def _compute_forwards(records: list[dict], r: float) -> dict[str, float]:
+    """
+    Calcule le forward implicite F(T) par maturité via la parité put-call :
+        F ≈ K + e^(rT) * (C_mid - P_mid)
+    Utilise les 5 strikes les plus proches de l'ATM avec call ET put disponibles.
+    Retourne dict[maturity_iso] → forward.
+    Fallback : Forward = Spot si pas assez de paires.
+    """
+    if not records:
+        return {}
+    df = pd.DataFrame(records)
+    forwards: dict[str, float] = {}
+
+    for mat, grp in df.groupby("Maturity"):
+        spot = float(grp["Spot"].iloc[0])
+        T    = float(grp["T"].iloc[0])
+
+        calls = grp[grp["Type"] == "C"].set_index("Strike")["Mid"]
+        puts  = grp[grp["Type"] == "P"].set_index("Strike")["Mid"]
+        common = sorted(set(calls.index) & set(puts.index))
+
+        if not common:
+            forwards[mat] = spot
+            continue
+
+        atm = min(common, key=lambda k: abs(k - spot))
+        idx = common.index(atm)
+        near = common[max(0, idx - 2) : idx + 3]
+
+        f_list = [k + math.exp(r * T) * (calls[k] - puts[k]) for k in near]
+        forwards[mat] = sum(f_list) / len(f_list)
+
+    return forwards
 
 
 # ── extraction pour un symbole ────────────────────────────────────────────────
@@ -213,31 +242,33 @@ def fetch_symbol(
     max_expiries: Optional[int] = None,
 ) -> pd.DataFrame:
     """
-    Extrait les options pour un symbole, calcule IV + grecs, filtre delta.
+    Extrait les options pour un symbole SPX ou action S&P 500,
+    calcule IV + grecs + forward par parité put-call.
 
     Paramètres
     ----------
     ib     : instance IB() déjà connectée
-    symbol : 'SX5E' ou un ticker Euro Stoxx 50
+    symbol : 'SPX' ou un ticker S&P 500 (ex: 'AAPL', 'BRK.B')
     r, q   : taux/dividende (défaut : SETTINGS.r / SETTINGS.q)
+
+    Note : Black-Scholes européen utilisé pour tout.
+    Pour les options sur actions US (style américain), c'est une approximation
+    acceptable sur les maturités courtes et pour les grecs de premier ordre.
 
     Retourne un DataFrame avec les colonnes standardisées, ou vide si erreur.
     """
     r = r if r is not None else SETTINGS.r
     q = q if q is not None else SETTINGS.q
-    multiplier = SETTINGS.MULTIPLIER if symbol == "SX5E" else 1
+    multiplier = SETTINGS.MULTIPLIER  # 100 pour SPX et actions US
 
-    # Supprime le bruit 10090/10167 (fallback données différées — attendu).
     _install_ibkr_log_filter()
-    # Données différées si pas d'abonnement temps réel (idempotent).
     ib.reqMarketDataType(_MARKET_DATA_TYPE)
 
     # ── 1. spot ───────────────────────────────────────────────────────────
     try:
-        underlying = _resolve_underlying(ib, symbol)
+        underlying = _resolve_underlying_us(ib, symbol)
         if underlying is None:
-            logger.warning("[%s] Contrat introuvable (devises testées : %s).",
-                           symbol, ", ".join(_CURRENCIES))
+            logger.warning("[%s] Contrat introuvable.", symbol)
             return pd.DataFrame()
 
         bars = ib.reqHistoricalData(
@@ -255,7 +286,7 @@ def fetch_symbol(
         spot = bars[-1].close
         logger.info("[%s] Spot = %.2f", symbol, spot)
     except Exception as exc:
-        logger.error("[%s] Erreur lors de la récupération du spot : %s", symbol, exc)
+        logger.error("[%s] Erreur récupération spot : %s", symbol, exc)
         return pd.DataFrame()
 
     # ── 2. liste des maturités disponibles ────────────────────────────────
@@ -271,10 +302,7 @@ def fetch_symbol(
         logger.error("[%s] Erreur reqSecDefOptParams : %s", symbol, exc)
         return pd.DataFrame()
 
-    # Sélection de la bourse dérivés native + sa trading class :
-    # on n'utilise QUE les échéances de cette entrée (cohérence garantie
-    # entre échéances, strikes et bourse — fin des erreurs 200).
-    param = _select_option_param(params, symbol)
+    param = _select_option_param_us(params, symbol)
     logger.info("[%s] Options via %s (tradingClass=%s).",
                 symbol, param.exchange, param.tradingClass)
 
@@ -288,10 +316,10 @@ def fetch_symbol(
     # ── 3. boucle sur les maturités ────────────────────────────────────────
     raw_rows: list[dict] = []
 
-    if _in_eurex_hours():
-        logger.info("[%s] EUREX ouvert — bid/ask live.", symbol)
+    if _in_us_hours():
+        logger.info("[%s] Marché US ouvert — bid/ask live.", symbol)
     else:
-        logger.info("[%s] Hors heures EUREX — fallback sur close du jour.", symbol)
+        logger.info("[%s] Hors heures US — fallback sur close du jour.", symbol)
 
     def _f(x) -> float:
         return float(x) if x is not None and x == x and x > 0 else math.nan
@@ -307,7 +335,7 @@ def fetch_symbol(
         if T <= 0:
             continue
 
-        contracts = _valid_contracts_for_expiry(
+        contracts = _valid_contracts_for_expiry_us(
             ib, symbol, expiry,
             exchange=param.exchange,
             trading_class=param.tradingClass,
@@ -338,10 +366,13 @@ def fetch_symbol(
                         mid = (bid + ask) / 2.0
                         if (ask - bid) / mid > 1.0:   # spread > 100% → illiquide
                             continue
+                        ref_type = "bid_ask"
                     elif math.isfinite(last) and last > 0:
                         mid = last
+                        ref_type = "last"
                     elif math.isfinite(close) and close > 0:
-                        mid = close   # prix de clôture EUREX du jour
+                        mid = close
+                        ref_type = "close"
                     else:
                         continue
 
@@ -352,6 +383,7 @@ def fetch_symbol(
                         "Type":     c.right,
                         "Bid":      bid,    "Ask":   ask,
                         "Mid":      mid,    "Volume": volume,
+                        "RefType":  ref_type,
                     })
                 except Exception as exc:
                     logger.debug("[%s] Ticker %s : %s", symbol, c, exc)
@@ -383,6 +415,7 @@ def fetch_symbol(
             "Ask":         row["Ask"],
             "Mid":         row["Mid"],
             "Volume":      row["Volume"],
+            "RefType":     row["RefType"],
             "ImpliedVol":  iv,
             "Delta":       g["Delta"],
             "Gamma":       g["Gamma"],
@@ -395,8 +428,17 @@ def fetch_symbol(
             "DollarTheta": g["Theta"] * multiplier,
         })
 
+    if not records:
+        logger.warning("[%s] Aucune IV calculable.", symbol)
+        return pd.DataFrame()
+
+    # ── 5. Forward par parité put-call ────────────────────────────────────
+    forwards = _compute_forwards(records, r)
+    for rec in records:
+        rec["Forward"] = forwards.get(rec["Maturity"], rec["Spot"])
+
     result = pd.DataFrame(records)
-    logger.info("[%s] %d lignes collectées (tous strikes avec IV valide).", symbol, len(result))
+    logger.info("[%s] %d lignes collectées (IV valide).", symbol, len(result))
     return result
 
 
