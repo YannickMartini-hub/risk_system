@@ -1,187 +1,148 @@
-"""
-Page 3 — Nappe de Volatilité 3D.
-
-Surface Plotly interactive (rotation/zoom) interpolée en variance totale σ²T.
-Log-moneyness forward-based k = ln(K/F).
-Axe X : log-moneyness ou strike (toggle).
-Overlay courbe SVI par maturité si paramètres disponibles.
-Points bruts optionnels.
-"""
-
-from __future__ import annotations
-
-import sys
-from datetime import date as _date
-from pathlib import Path
-
-import numpy as np
-import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from risk_system.market_data import load_latest_snapshot
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+st.set_page_config(page_title="Risk System - Nappe de Volatilité", layout="wide", page_icon="📈")
 
-from risk_system.surface import build_surface
-from risk_system.market_data import list_snapshots
-from risk_system.svi import load_latest_svi_params, svi_vol
+st.title("📈 Analyse des Nappes de Volatilité Implicite")
+st.write("Cartographie et modélisation des structures par terme de la volatilité.")
 
-st.set_page_config(page_title="Risk System — Surface", layout="wide")
-st.title("Nappe de Volatilité Implicite")
+df = load_latest_snapshot()
 
-# ── snapshot ──────────────────────────────────────────────────────────────────
-snapshots = list_snapshots()
-if not snapshots:
-    st.warning("Aucun snapshot. Lancez `python scripts/fetch_data.py`.")
+if df.empty:
+    st.warning("⚠️ Aucun snapshot trouvé. Veuillez exécuter l'extraction de données.")
     st.stop()
 
-snapshot_names = [p.name for p in snapshots]
-selected_name  = st.sidebar.selectbox("Snapshot", snapshot_names)
-selected_path  = next(p for p in snapshots if p.name == selected_name)
+available_tickers = sorted(df["Symbol"].unique())
+default_idx = available_tickers.index("SX5E") if "SX5E" in available_tickers else 0
+selected_ticker = st.selectbox("Sélectionnez la surface à analyser :", available_tickers, index=default_idx)
 
+df_surface = df[df["Symbol"] == selected_ticker].copy()
+spot_price = df_surface["Spot"].iloc[0]
 
-@st.cache_data
-def _load(path: str) -> pd.DataFrame:
-    return pd.read_parquet(path)
+# ── LOGIQUE DES TENORS (Cohérence avec l'Accueil) ─────────────────────────────
+def map_days_to_tenor(t_years):
+    days = round(t_years * 365.25)
+    if days <= 20: return "2W"
+    elif days <= 45: return "1M"
+    elif days <= 120: return "3M"
+    elif days <= 220: return "6M"
+    elif days <= 310: return "9M"
+    elif days <= 420: return "12M"
+    elif days <= 600: return "18M"
+    elif days <= 800: return "24M"
+    else: return "36M"
 
+# Application de la fonction pour créer le label de légende propre
+df_surface["Tenor"] = df_surface["T"].apply(map_days_to_tenor)
+df_surface["LegendLabel"] = df_surface["Tenor"] + " (" + df_surface["Maturity"] + ")"
 
-@st.cache_data
-def _load_svi(path: str) -> pd.DataFrame:
-    return pd.read_parquet(path) if path else pd.DataFrame()
+# ── SELECTION DE LA METRIQUE DE L'AXE X ───────────────────────────────────────
+st.sidebar.subheader("📐 Paramètres de l'Axe Horizontal")
+x_axis_type = st.sidebar.radio(
+    "Métrique de l'axe X :",
+    ["Strike Absolu", "Moneyness (K/S)", "Log-Moneyness ln(K/S)"]
+)
 
+# Préparation des variables de coordonnées
+df_surface["Moneyness"] = df_surface["Strike"] / spot_price
+df_surface["LogMoneyness"] = np.log(df_surface["Moneyness"])
 
-df_all = _load(str(selected_path))
+if x_axis_type == "Strike Absolu":
+    x_col = "Strike"
+    x_label = "Prix d'Exercice (Strike)"
+elif x_axis_type == "Moneyness (K/S)":
+    x_col = "Moneyness"
+    x_label = "Moneyness (K / S)"
+else:
+    x_col = "LogMoneyness"
+    x_label = "Log-Moneyness ln(K / S)"
 
-# Charge les paramètres SVI les plus récents (si disponibles)
-svi_files = sorted(selected_path.parent.glob("svi_params_*.parquet"), reverse=True)
-df_svi    = _load_svi(str(svi_files[0])) if svi_files else pd.DataFrame()
+# ── SELECTION DES OPTIONS OUT-OF-THE-MONEY (OTM) ──────────────────────────────
+filter_otm = st.sidebar.checkbox("Filtrer uniquement les options OTM (Recommandé)", value=True)
 
-# ── sélecteurs ────────────────────────────────────────────────────────────────
-symbols = sorted(df_all["Symbol"].unique())
-symbol  = st.sidebar.selectbox("Sous-jacent", symbols)
+if filter_otm:
+    df_surface = df_surface[
+        ((df_surface["Type"] == "P") & (df_surface["Strike"] < spot_price)) |
+        ((df_surface["Type"] == "C") & (df_surface["Strike"] >= spot_price))
+    ]
 
-x_axis    = st.sidebar.radio("Axe X", ["Log-Moneyness ln(K/F)", "Strike"], index=0)
-show_raw  = st.sidebar.checkbox("Afficher les points de marché", value=True)
-show_svi  = st.sidebar.checkbox("Overlay SVI", value=not df_svi.empty)
-n_grid    = st.sidebar.slider("Résolution de la grille", 20, 100, 50, step=5)
+# ── FILTRES QUALITÉ ───────────────────────────────────────────────────────────
+st.sidebar.subheader("🛡️ Filtrage des Valeurs Aberrantes")
+max_iv_slider = st.sidebar.slider("Volatilité Implicite Max Acceptée (%)", min_value=50, max_value=250, value=90)
 
-# ── construction de la surface ────────────────────────────────────────────────
-df_sym = df_all[df_all["Symbol"] == symbol].copy()
+df_surface = df_surface[
+    (df_surface["Volume"] >= 0) & 
+    (df_surface["ImpliedVol"] >= 0.01) & 
+    (df_surface["ImpliedVol"] <= max_iv_slider / 100.0)
+]
 
-try:
-    X, Y, Z = build_surface(df_sym, symbol, n_grid=n_grid)
-except ValueError as exc:
-    st.error(str(exc))
+if df_surface.empty:
+    st.error("Aucune donnée ne correspond aux critères sélectionnés.")
     st.stop()
 
-# Forward de référence (première valeur disponible par maturité, fallback Spot)
-if "Forward" in df_sym.columns:
-    fwd_ref = float(df_sym.groupby("Maturity")["Forward"].first().mean())
-else:
-    fwd_ref = float(df_sym["Spot"].iloc[0])
+# ── GRAPHIC 3D SURFACE ────────────────────────────────────────────────────────
+st.subheader(f"Surface de Volatilité 3D — {selected_ticker} (Spot: {spot_price:.2f} €)")
 
-# Conversion axe X si besoin
-use_strike = x_axis == "Strike"
-if use_strike:
-    X_display = fwd_ref * np.exp(X)
-    x_label   = "Strike"
-else:
-    X_display = X
-    x_label   = "Log-Moneyness k=ln(K/F)"
+fig_3d = go.Figure(data=[go.Mesh3d(
+    x=df_surface[x_col],
+    y=df_surface['T'] * 365.25,
+    z=df_surface['ImpliedVol'] * 100,
+    intensity=df_surface['ImpliedVol'] * 100,
+    colorscale='Viridis',
+    opacity=0.88
+)])
 
-# ── figure Plotly ─────────────────────────────────────────────────────────────
-fig = go.Figure()
-
-fig.add_trace(go.Surface(
-    x=X_display,
-    y=Y,
-    z=Z * 100,           # en pourcentage
-    colorscale="Viridis",
-    opacity=0.85,
-    colorbar=dict(title="IV (%)"),
-    name="Surface interpolée",
-    hovertemplate=(
-        f"{x_label}: %{{x:.4f}}<br>"
-        "Maturité: %{y:.4f} an<br>"
-        "IV: %{z:.2f}%<extra></extra>"
-    ),
-))
-
-# ── points de marché bruts ────────────────────────────────────────────────────
-if show_raw:
-    fwd_col = df_sym["Forward"].values if "Forward" in df_sym.columns else df_sym["Spot"].values
-    k_raw   = np.log(df_sym["Strike"].values / fwd_col)
-    x_raw   = fwd_ref * np.exp(k_raw) if use_strike else k_raw
-    fig.add_trace(go.Scatter3d(
-        x=x_raw,
-        y=df_sym["T"].values,
-        z=df_sym["ImpliedVol"].values * 100,
-        mode="markers",
-        marker=dict(size=3, color="red", opacity=0.7),
-        name="Points de marché",
-        hovertemplate=(
-            f"{x_label}: %{{x:.4f}}<br>"
-            "T: %{y:.4f}<br>"
-            "IV: %{z:.2f}%<extra></extra>"
-        ),
-    ))
-
-# ── overlay SVI par maturité ─────────────────────────────────────────────────
-if show_svi and not df_svi.empty:
-    svi_sym = df_svi[df_svi["Symbol"] == symbol]
-    if not svi_sym.empty:
-        k_range = np.linspace(X.min(), X.max(), 80)
-        for _, svi_row in svi_sym.iterrows():
-            T_val  = float(svi_row["T"])
-            params = {c: float(svi_row[c]) for c in ("a", "b", "rho", "m", "sigma_svi")}
-            params["sigma"] = params.pop("sigma_svi")
-            iv_curve = svi_vol(k_range, T_val, params) * 100
-            x_curve  = fwd_ref * np.exp(k_range) if use_strike else k_range
-            fig.add_trace(go.Scatter3d(
-                x=x_curve,
-                y=np.full_like(k_range, T_val),
-                z=iv_curve,
-                mode="lines",
-                line=dict(color="orange", width=4),
-                name=f"SVI {svi_row['Maturity']}",
-                hovertemplate=(
-                    f"SVI — T={T_val:.3f}an<br>"
-                    f"{x_label}: %{{x:.4f}}<br>"
-                    "IV SVI: %{z:.2f}%<extra></extra>"
-                ),
-            ))
-
-fig.update_layout(
+fig_3d.update_layout(
     scene=dict(
         xaxis_title=x_label,
-        yaxis_title="Maturité (ans)",
-        zaxis_title="Vol implicite (%)",
-        camera=dict(eye=dict(x=1.5, y=-1.5, z=0.8)),
-        xaxis=dict(backgroundcolor="rgb(245,245,245)"),
-        yaxis=dict(backgroundcolor="rgb(245,245,245)"),
-        zaxis=dict(backgroundcolor="rgb(245,245,245)"),
+        yaxis_title="Maturité (Jours)",
+        zaxis_title="Volatilité Implicite (%)"
     ),
-    height=680,
-    margin=dict(l=0, r=0, t=30, b=0),
-    legend=dict(x=0.02, y=0.98),
-    title=dict(
-        text=f"Surface de vol — {symbol}",
-        x=0.5, xanchor="center",
-    ),
+    margin=dict(l=10, r=10, b=10, t=10),
+    height=600
 )
+st.plotly_chart(fig_3d, use_container_width=True)
 
-st.plotly_chart(fig, use_container_width=True)
+# ── GRAPHIC 2D SMILES ─────────────────────────────────────────────────────────
+st.subheader("Coupes Transversales : Structures par Strike / Monnaie")
 
-# ── statistiques rapides ──────────────────────────────────────────────────────
-col1, col2, col3 = st.columns(3)
-with col1:
-    st.metric("Min IV", f"{df_sym['ImpliedVol'].min()*100:.1f}%")
-with col2:
-    st.metric("Médiane IV", f"{df_sym['ImpliedVol'].median()*100:.1f}%")
-with col3:
-    st.metric("Max IV", f"{df_sym['ImpliedVol'].max()*100:.1f}%")
+# Extraction des labels uniques triés par le temps (T) pour respecter l'ordre chronologique
+unique_mats = df_surface[['Maturity', 'T', 'LegendLabel']].drop_duplicates().sort_values('T')
 
-svi_status = f"{len(df_svi[df_svi['Symbol']==symbol])} tranches SVI" if not df_svi.empty else "pas de params SVI"
-st.caption(
-    f"Interpolation en variance totale σ²T | log-moneyness k=ln(K/F) | "
-    f"grille {n_grid}×{n_grid} | {svi_status} | {symbol} | {selected_name}"
+fig_2d = go.Figure()
+
+for _, row in unique_mats.iterrows():
+    mat = row["Maturity"]
+    label = row["LegendLabel"]
+    
+    df_mat = df_surface[df_surface["Maturity"] == mat].sort_values(x_col)
+    
+    if len(df_mat) > 3:
+        fig_2d.add_trace(go.Scatter(
+            x=df_mat[x_col],
+            y=df_mat["ImpliedVol"] * 100,
+            mode='lines+markers',
+            name=label  # Utilisation du nouveau label "Tenor (Date)"
+        ))
+
+# Repère vertical pour l'ATM
+if x_axis_type == "Strike Absolu":
+    ref_line = spot_price
+elif x_axis_type == "Moneyness (K/S)":
+    ref_line = 1.0
+else:
+    ref_line = 0.0
+
+fig_2d.add_vline(x=ref_line, line_dash="dash", line_color="red", annotation_text="Niveau ATM")
+
+fig_2d.update_layout(
+    xaxis_title=x_label,
+    yaxis_title="Volatilité Implicite (%)",
+    hovermode="x unified",
+    height=500,
+    legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
 )
+st.plotly_chart(fig_2d, use_container_width=True)

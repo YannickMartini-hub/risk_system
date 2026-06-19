@@ -1,221 +1,205 @@
-"""
-Page 1 — Option Chain (Prix du marché).
-
-Tableau style salle de marché : Calls | Strike | Puts
-avec volume, IV, grecs en valeur et en $.
-Filtre delta : 0.20 ≤ |Δ| ≤ 0.80 (ATM inclus, deep OTM exclus).
-Lit le dernier snapshot Parquet disponible — aucune connexion IBKR.
-"""
-
-from __future__ import annotations
-
-import sys
-from datetime import date as _date
-from pathlib import Path
-
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import numpy as np
+from risk_system.market_data import load_latest_snapshot
+from risk_system.implied_vol import implied_vol
+from risk_system.greeks import all_greeks
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+st.set_page_config(page_title="Risk System - Accueil", layout="wide", page_icon="📊")
 
-from risk_system.config import SETTINGS
-from risk_system.market_data import list_snapshots
+st.title("📊 Système de Gestion des Risques — Euro Stoxx 50")
+st.write("Visualisation dynamique des chaînes d'options au standard institutionnel (% et €).")
 
-_TENORS = [("1w", 7), ("2w", 14), ("1m", 30), ("2m", 60), ("3m", 91),
-           ("4m", 122), ("6m", 182), ("9m", 273), ("1y", 365), ("18m", 548), ("2y", 730)]
+# ── 1. GESTION DES PARAMÈTRES ET DE LA RÉACTIVITÉ ─────────────────────────────
+r = st.session_state.get("r", 0.035)
+q = st.session_state.get("q", 0.0)
 
+st.sidebar.markdown("### 🌐 Conditions de Marché Actuelles")
+st.sidebar.markdown(f"Taux sans risque ($r$) : **{r:.3%}**")
+st.sidebar.markdown(f"Rendement div. ($q$) : **{q:.3%}**")
 
-def _tenor_label(mat_str: str) -> str:
-    days = (_date.fromisoformat(mat_str) - _date.today()).days
-    if days <= 0:
-        return mat_str
-    return min(_TENORS, key=lambda x: abs(x[1] - days))[0]
+if st.sidebar.button("🔄 Forcer le recalcul global"):
+    st.cache_data.clear()
+    st.rerun()
 
+# ── 2. CHARGEMENT ET FILTRAGE DE L'UNIVERS ────────────────────────────────────
+df_raw = load_latest_snapshot()
 
-def _maturity_options(maturities: list[str]) -> list[tuple[str, str]]:
-    labeled = [(mat, _tenor_label(mat)) for mat in maturities]
-    counts: dict[str, int] = {}
-    for _, lbl in labeled:
-        counts[lbl] = counts.get(lbl, 0) + 1
-    return [(f"{lbl} ({mat})", mat) if counts[lbl] > 1 else (lbl, mat)
-            for mat, lbl in labeled]
-
-
-st.set_page_config(
-    page_title="Risk System — Option Chain",
-    page_icon="📊",
-    layout="wide",
-)
-
-# ── sidebar ───────────────────────────────────────────────────────────────────
-st.sidebar.title("Risk System")
-
-snapshots = list_snapshots()
-if not snapshots:
-    st.title("Option Chain")
-    st.warning(
-        "Aucun snapshot disponible dans `data/parquet/`.\n\n"
-        "Lancez d'abord la collecte :\n```bash\npython scripts/fetch_data.py\n```"
-    )
+if df_raw.empty:
+    st.warning("⚠️ Aucun snapshot de marché trouvé. Veuillez lancer l'extraction via `scripts/fetch_data.py`.")
     st.stop()
 
-snapshot_names = [p.name for p in snapshots]
-selected_name  = st.sidebar.selectbox("Snapshot", snapshot_names)
-selected_path  = next(p for p in snapshots if p.name == selected_name)
+available_tickers = sorted(df_raw["Symbol"].unique())
+default_idx = available_tickers.index("SX5E") if "SX5E" in available_tickers else 0
 
+selected_ticker = st.selectbox("Sélectionnez un sous-jacent :", available_tickers, index=default_idx)
+df_ticker = df_raw[df_raw["Symbol"] == selected_ticker].copy()
 
+if df_ticker.empty:
+    st.error("Aucune donnée disponible pour ce symbole.")
+    st.stop()
+
+spot_price = df_ticker["Spot"].iloc[0]
+st.metric(label=f"Prix Spot de Référence ({selected_ticker})", value=f"{spot_price:,.2f} €")
+
+# ── 3. MOTEUR DE RECALCUL DYNAMIQUE DES GRECS (% ET €) ────────────────────────
 @st.cache_data
-def _load(path: str) -> pd.DataFrame:
-    return pd.read_parquet(path)
+def recalculate_chain_with_greeks(df_data, r_rate, q_dividend):
+    records = []
+    for _, row in df_data.iterrows():
+        c_mult = row.get("ContractMultiplier", 100.0) if pd.notna(row.get("ContractMultiplier")) else 10.0 if row["Symbol"] == "SX5E" else 100.0
+        
+        iv = implied_vol(row["Spot"], row["Strike"], row["T"], r_rate, q_dividend, row["Mid"], row["Type"])
+        if iv is None or not np.isfinite(iv):
+            continue
+            
+        g = all_greeks(row["Spot"], row["Strike"], row["T"], r_rate, q_dividend, iv, right=row["Type"], multiplier=c_mult)
+        
+        records.append({
+            "Strike": row["Strike"], "Maturity": row["Maturity"], "T": row["T"], "Type": row["Type"],
+            "Bid": row["Bid"], "Ask": row["Ask"], "Mid": row["Mid"], "Volume": row["Volume"],
+            "ImpliedVol": iv,
+            "Delta_%": g["Delta"], "Gamma_%": g["Gamma"], "Vega_%": g["Vega"], "Theta_%": g["Theta"],
+            "Delta_EUR": g["Delta"] * row["Spot"] * c_mult,
+            "Gamma_EUR": g["DollarGamma"],
+            "Vega_EUR": g["DollarVega"],
+            "Theta_EUR": g["Theta"] * c_mult
+        })
+    return pd.DataFrame(records)
 
+with st.spinner("Calcul des structures de risques en cours..."):
+    df_recalc = recalculate_chain_with_greeks(df_ticker, r, q)
 
-df_all = _load(str(selected_path))
+# ── 4. SÉLECTION DU TENOR INTERMÉDIAIRE ───────────────────────────────────────
+def map_days_to_tenor(t_years):
+    days = round(t_years * 365.25)
+    if days <= 20: return "2W"
+    elif days <= 45: return "1M"
+    elif days <= 120: return "3M"
+    elif days <= 220: return "6M"
+    elif days <= 310: return "9M"
+    elif days <= 420: return "12M"
+    elif days <= 600: return "18M"
+    elif days <= 800: return "24M"
+    else: return "36M"
 
-symbols    = sorted(df_all["Symbol"].unique())
-symbol     = st.sidebar.selectbox("Sous-jacent", symbols)
-df_sym     = df_all[df_all["Symbol"] == symbol]
-maturities  = sorted(df_sym["Maturity"].unique())
-mat_opts    = _maturity_options(maturities)
-mat_labels  = [lbl for lbl, _ in mat_opts]
-mat_dates   = [dt  for _, dt  in mat_opts]
-mat_label   = st.sidebar.selectbox("Maturité", mat_labels)
-maturity    = mat_dates[mat_labels.index(mat_label)]
+df_recalc["Tenor"] = df_recalc["T"].apply(map_days_to_tenor)
+df_recalc["DropdownLabel"] = df_recalc["Tenor"] + " (" + df_recalc["Maturity"] + ")"
 
-df = df_sym[df_sym["Maturity"] == maturity].copy()
+unique_maturities_df = df_recalc[['Maturity', 'T', 'DropdownLabel']].drop_duplicates().sort_values('T')
+dropdown_options = unique_maturities_df["DropdownLabel"].tolist()
 
-# ── filtre delta : 0.20 ≤ |Δ| ≤ 0.80 (ATM inclus, deep OTM exclus) ──────────
-if "Delta" in df.columns and not df.empty:
-    delta_abs = df["Delta"].abs()
-    df = df[delta_abs.between(SETTINGS.DELTA_ABS_MIN, SETTINGS.DELTA_ABS_MAX)]
+selected_label = st.selectbox("Sélectionnez une échéance (Tenor) :", dropdown_options)
+df_mat = df_recalc[df_recalc["DropdownLabel"] == selected_label]
 
-# ── en-tête ───────────────────────────────────────────────────────────────────
-spot_val = float(df["Spot"].iloc[0]) if not df.empty else 0.0
-T_val    = float(df["T"].iloc[0])    if not df.empty else 0.0
+calls = df_mat[df_mat["Type"] == "C"].sort_values("Strike")
+puts = df_mat[df_mat["Type"] == "P"].sort_values("Strike")
 
-st.title(f"Option Chain — {symbol}")
-st.caption(
-    f"Spot : **{spot_val:,.2f}** | Maturité : **{mat_label}** ({maturity}) | "
-    f"T : **{T_val:.4f} an** | Snapshot : `{selected_name}` | "
-    f"Filtre Δ : **{SETTINGS.DELTA_ABS_MIN:.2f} – {SETTINGS.DELTA_ABS_MAX:.2f}**"
-)
+cols_to_merge = ['Strike', 'Bid', 'Ask', 'Mid', 'ImpliedVol', 'Delta_%', 'Delta_EUR', 'Gamma_%', 'Gamma_EUR', 'Vega_%', 'Vega_EUR', 'Theta_%', 'Theta_EUR']
 
-if df.empty:
-    st.info("Aucune donnée pour cette sélection (filtre delta peut-être trop strict).")
+# LA CORRECTION EST ICI : how='outer' permet de garder les strikes orphelins (uniquement Call ou uniquement Put)
+chain = pd.merge(
+    calls[cols_to_merge], puts[cols_to_merge],
+    on='Strike', how='outer', suffixes=('_Call', '_Put')
+).sort_values("Strike")
+
+if chain.empty:
+    st.warning("Aucune donnée disponible pour cette maturité.")
     st.stop()
 
-# ── construction du tableau option chain ──────────────────────────────────────
-calls = df[df["Type"] == "C"].set_index("Strike").sort_index()
-puts  = df[df["Type"] == "P"].set_index("Strike").sort_index()
-all_strikes = sorted(set(calls.index) | set(puts.index))
+# ── 5. ALIGNEMENT DES COLONNES STANDARDISÉES : CALLS | STRIKE | PUTS ──────────
+call_display_cols = [
+    'Delta_%_Call', 'Delta_EUR_Call', 'Gamma_%_Call', 'Gamma_EUR_Call', 
+    'Vega_%_Call', 'Vega_EUR_Call', 'Theta_%_Call', 'Theta_EUR_Call', 
+    'ImpliedVol_Call', 'Bid_Call', 'Ask_Call', 'Mid_Call'
+]
 
-atm_strike = min(all_strikes, key=lambda k: abs(k - spot_val))
+put_display_cols = [
+    'Mid_Put', 'Ask_Put', 'Bid_Put', 'ImpliedVol_Put', 
+    'Delta_%_Put', 'Delta_EUR_Put', 'Gamma_%_Put', 'Gamma_EUR_Put', 
+    'Vega_%_Put', 'Vega_EUR_Put', 'Theta_%_Put', 'Theta_EUR_Put'
+]
 
-rows = []
-for k in all_strikes:
-    c = calls.loc[k] if k in calls.index else pd.Series(dtype=float)
-    p = puts.loc[k]  if k in puts.index  else pd.Series(dtype=float)
+chain = chain[call_display_cols + ['Strike'] + put_display_cols]
 
-    def _get(series: pd.Series, col: str) -> float:
-        return float(series[col]) if col in series.index and pd.notna(series[col]) else float("nan")
+# L'ASTUCE : On ajoute un espace " " à la fin des noms de colonnes des Puts pour duper Pandas.
+rename_dict = {
+    'Strike': 'Strike',
+    'Bid_Call': 'Bid', 'Ask_Call': 'Ask', 'Mid_Call': 'Mid', 'ImpliedVol_Call': 'IV',
+    'Delta_%_Call': 'Δ (%)', 'Delta_EUR_Call': 'Δ (€)', 'Gamma_%_Call': 'Γ (%)', 'Gamma_EUR_Call': 'Γ (€)',
+    'Vega_%_Call': '𝒱 (%)', 'Vega_EUR_Call': '𝒱 (€)', 'Theta_%_Call': 'Θ (%)', 'Theta_EUR_Call': 'Θ (€)',
+    'Bid_Put': 'Bid ', 'Ask_Put': 'Ask ', 'Mid_Put': 'Mid ', 'ImpliedVol_Put': 'IV ',
+    'Delta_%_Put': 'Δ (%) ', 'Delta_EUR_Put': 'Δ (€) ', 'Gamma_%_Put': 'Γ (%) ', 'Gamma_EUR_Put': 'Γ (€) ',
+    'Vega_%_Put': '𝒱 (%) ', 'Vega_EUR_Put': '𝒱 (€) ', 'Theta_%_Put': 'Θ (%) ', 'Theta_EUR_Put': 'Θ (€) '
+}
+chain_renamed = chain.rename(columns=rename_dict)
 
-    def _iv(series: pd.Series) -> float:
-        v = _get(series, "ImpliedVol")
-        return v * 100 if not pd.isna(v) else float("nan")
+# ── 6. FORMATAGE EN TEXTE PUR (ANTI-STREAMLIT NONE) ───────────────────────────
+def format_to_string(val, fmt_string):
+    """Convertit brutalement la valeur en texte. Si vide, renvoie un tiret strict."""
+    # On traque toutes les formes possibles de vide (NaN, None, "<NA>")
+    if pd.isna(val) or val is None or str(val).lower().strip() in ['nan', 'none', '<na>', '']:
+        return "-"
+    try:
+        return fmt_string.format(float(val))
+    except (ValueError, TypeError):
+        return "-"
 
-    rows.append({
-        # ── CALLS ────────────────────────────────────────────────────────
-        "Vol C":   _get(c, "Volume"),
-        "Bid C":   _get(c, "Bid"),
-        "Ask C":   _get(c, "Ask"),
-        "Mid C":   _get(c, "Mid"),
-        "IV C %":  _iv(c),
-        "Δ C":     _get(c, "Delta"),
-        "Γ C":     _get(c, "Gamma"),
-        "V C":     _get(c, "Vega"),
-        "Θ C":     _get(c, "Theta"),
-        "$Δ C":    _get(c, "DollarDelta"),
-        "$Γ C":    _get(c, "DollarGamma"),
-        "$V C":    _get(c, "DollarVega"),
-        "$Θ C":    _get(c, "DollarTheta"),
-        # ── STRIKE ───────────────────────────────────────────────────────
-        "Strike":  k,
-        "_atm":    k == atm_strike,
-        # ── PUTS ─────────────────────────────────────────────────────────
-        "Vol P":   _get(p, "Volume"),
-        "Bid P":   _get(p, "Bid"),
-        "Ask P":   _get(p, "Ask"),
-        "Mid P":   _get(p, "Mid"),
-        "IV P %":  _iv(p),
-        "Δ P":     _get(p, "Delta"),
-        "Γ P":     _get(p, "Gamma"),
-        "V P":     _get(p, "Vega"),
-        "Θ P":     _get(p, "Theta"),
-        "$Δ P":    _get(p, "DollarDelta"),
-        "$Γ P":    _get(p, "DollarGamma"),
-        "$V P":    _get(p, "DollarVega"),
-        "$Θ P":    _get(p, "DollarTheta"),
-    })
-
-chain_df  = pd.DataFrame(rows)
-# Convertit toutes les colonnes numériques en float64 pour que na_rep="—" fonctionne
-_num_cols = [c for c in chain_df.columns if c not in ("Strike", "_atm")]
-chain_df[_num_cols] = chain_df[_num_cols].apply(pd.to_numeric, errors="coerce")
-display_df = chain_df.drop(columns=["_atm"])
-atm_flags  = chain_df["_atm"].values
-
-# ── style ──────────────────────────────────────────────────────────────────────
-_FMT = {
-    "Strike":  "{:.0f}",
-    # marché
-    "Vol C":  "{:.0f}",   "Vol P":  "{:.0f}",
-    "Bid C":  "{:.2f}",   "Bid P":  "{:.2f}",
-    "Ask C":  "{:.2f}",   "Ask P":  "{:.2f}",
-    "Mid C":  "{:.2f}",   "Mid P":  "{:.2f}",
-    "IV C %": "{:.1f}",   "IV P %": "{:.1f}",
-    # grecs en valeur
-    "Δ C":    "{:.4f}",   "Δ P":    "{:.4f}",
-    "Γ C":    "{:.6f}",   "Γ P":    "{:.6f}",
-    "V C":    "{:.2f}",   "V P":    "{:.2f}",
-    "Θ C":    "{:.2f}",   "Θ P":    "{:.2f}",
-    # grecs en $
-    "$Δ C":   "{:.0f}",   "$Δ P":   "{:.0f}",
-    "$Γ C":   "{:.2f}",   "$Γ P":   "{:.2f}",
-    "$V C":   "{:.2f}",   "$V P":   "{:.2f}",
-    "$Θ C":   "{:.2f}",   "$Θ P":   "{:.2f}",
+# Dictionnaire des formats pour chaque colonne
+format_dict = {
+    'Strike': '{:.1f}',
+    'Bid': '{:.2f} €', 'Ask': '{:.2f} €', 'Mid': '{:.2f} €', 'IV': '{:.2%}',
+    'Δ (%)': '{:.1%}', 'Γ (%)': '{:.3f}', '𝒱 (%)': '{:.2f}', 'Θ (%)': '{:.2f}',
+    'Δ (€)': '{:.0f} €', 'Γ (€)': '{:.0f} €', '𝒱 (€)': '{:.0f} €', 'Θ (€)': '{:.0f} €',
+    
+    # Colonnes Puts (avec l'espace invisible)
+    'Bid ': '{:.2f} €', 'Ask ': '{:.2f} €', 'Mid ': '{:.2f} €', 'IV ': '{:.2%}',
+    'Δ (%) ': '{:.1%}', 'Γ (%) ': '{:.3f}', '𝒱 (%) ': '{:.2f}', 'Θ (%) ': '{:.2f}',
+    'Δ (€) ': '{:.0f} €', 'Γ (€) ': '{:.0f} €', '𝒱 (€) ': '{:.0f} €', 'Θ (€) ': '{:.0f} €'
 }
 
-_ATM_STYLE    = "background-color: #5c4d00; color: #ffe97f; font-weight: bold"
-_STRIKE_STYLE = "font-weight: bold"
+# On écrase les nombres par des chaînes de caractères définitives
+for col, fmt in format_dict.items():
+    if col in chain_renamed.columns:
+        chain_renamed[col] = chain_renamed[col].apply(lambda x: format_to_string(x, fmt))
 
+# ── 7. APPLICATION DU STYLING GRAPHIQUE ───────────────────────────────────────
+strikes_arr = chain['Strike'].dropna().to_numpy()
+if len(strikes_arr) > 0:
+    atm_strike = strikes_arr[np.abs(strikes_arr - spot_price).argmin()]
+else:
+    atm_strike = None
 
-def _highlight(row):
-    if atm_flags[row.name]:
-        return [_ATM_STYLE] * len(row)
-    styles = []
-    for col in row.index:
-        if col == "Strike":
-            styles.append(_STRIKE_STYLE)
-        else:
-            styles.append("")
-    return styles
+def style_desk_matrix(df_matrix):
+    styles = np.full(df_matrix.shape, '', dtype=object)
+    strike_idx = 12  # Le Strike est la 13ème colonne (index 12)
 
+    for r_idx in range(df_matrix.shape[0]):
+        strike_val = df_matrix.iloc[r_idx, strike_idx]
+        
+        # Sécurité : on ignore si le strike a été transformé en tiret
+        if strike_val == "-":
+            continue
+            
+        current_strike = float(strike_val)
+        is_atm = (current_strike == atm_strike)
+        
+        for c_idx in range(df_matrix.shape[1]):
+            if is_atm:
+                styles[r_idx, c_idx] = 'background-color: rgba(255, 193, 7, 0.35); color: black; font-weight: bold; border-top: 1px solid #ffc107; border-bottom: 1px solid #ffc107;'
+            else:
+                if c_idx == strike_idx:
+                    styles[r_idx, c_idx] = 'background-color: #e9ecef; font-weight: bold; color: #495057; text-align: center;'
+                elif c_idx < strike_idx:
+                    styles[r_idx, c_idx] = 'background-color: rgba(52, 152, 219, 0.04); color: #2c3e50;'
+                else:
+                    styles[r_idx, c_idx] = 'background-color: rgba(231, 76, 60, 0.04); color: #2c3e50;'
 
-styled = (
-    display_df.style
-    .apply(_highlight, axis=1)
-    .format(_FMT, na_rep="—")
-)
+    return pd.DataFrame(styles, index=df_matrix.index, columns=df_matrix.columns)
 
-st.dataframe(
-    styled,
-    use_container_width=True,
-    height=620,
-)
+# Plus besoin de .format() ici car tout est déjà converti en texte dans le dataframe !
+formatted_chain = chain_renamed.style.apply(style_desk_matrix, axis=None)
 
-st.caption(
-    "**Grecs en valeur** : Δ (sans unité) | Γ (par point²) | "
-    "Vega (par 1% de vol) | Θ (par jour cal.) — "
-    "**Grecs en $** : $Δ = Δ × Spot × mult | $Γ = Γ × Spot² × mult | "
-    "$Vega = Vega × mult | $Θ = Θ × mult — "
-    "Strike ATM surligné | mult = 100 (SPX / actions US)"
-)
+st.dataframe(formatted_chain, use_container_width=True, height=650)
+st.caption("🔵 Sections Bleues : Options Calls | ⚪ Axe Central : Strikes | 🔴 Sections Rouges : Options Puts. "
+           "La ligne jaune indique le niveau At-The-Money (ATM). Les tirets (-) indiquent une absence de cotation au marché.")

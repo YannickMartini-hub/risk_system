@@ -1,52 +1,43 @@
 """
 Configuration globale du système de risque.
-Aucun chemin absolu : tous les chemins sont résolus relativement à la racine du projet.
+Adaptée pour l'Euro Stoxx 50.
 """
 
 from __future__ import annotations
-
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# Racine du projet : deux niveaux au-dessus de src/risk_system/
 _ROOT = Path(__file__).resolve().parents[2]
-
 
 @dataclass
 class Settings:
-    """Paramètres globaux (connexion IBKR, marché, chemins, conventions)."""
-
     # ── connexion IBKR ────────────────────────────────────────────────────
     host: str = "127.0.0.1"
-    port: int = 4002
+    port: int = 4002 # Port standard pour IB Gateway en mode Paper/Demo
     client_id: int = 1
 
     # ── paramètres de marché par défaut ───────────────────────────────────
-    r: float = 0.045   # taux US (Fed funds / 10Y ~ 4.5%)
+    r: float = 0.035   # Taux sans risque EUR (ex: ESTER ou Bund ~ 3.5%)
     q: float = 0.0
 
-    # ── filtre delta : borne basse = ATM − 30Δ, borne haute = ATM + 30Δ ──
-    # En valeur absolue : 0.20 ≤ |Δ| ≤ 0.80 (calls et puts)
+    # ── filtre delta ──────────────────────────────────────────────────────
     DELTA_ABS_MIN: float = 0.20
     DELTA_ABS_MAX: float = 0.80
 
-    # ── SPX (CBOE, mult=100) ──────────────────────────────────────────────
-    MULTIPLIER: int = 100
+    # ── Euro Stoxx 50 (EUREX, OESX, mult=10) ──────────────────────────────
+    MULTIPLIER: int = 10  # ATTENTION: Le S&P500 était à 100, le SX5E est à 10 !
 
     # ── conventions de temps ──────────────────────────────────────────────
-    T_BASIS: float = 365.25   # ACT/365.25 pour annualiser T
-    THETA_BASIS: float = 365.0  # theta par jour calendaire
+    T_BASIS: float = 365.25
+    THETA_BASIS: float = 365.0
 
-    # ── chemins relatifs à la racine ──────────────────────────────────────
+    # ── chemins ───────────────────────────────────────────────────────────
     data_dir: Path = field(default_factory=lambda: _ROOT / "data")
     parquet_dir: Path = field(default_factory=lambda: _ROOT / "data" / "parquet")
-    reference_dir: Path = field(default_factory=lambda: _ROOT / "data" / "reference")
+    
+    # On pointe vers le nouvel univers
     tickers_file: Path = field(
-        default_factory=lambda: _ROOT / "data" / "reference" / "sp500_top50_universe.xlsx"
+        default_factory=lambda: _ROOT / "data" / "reference" / "euro_stoxx_50_universe.xlsx"
     )
-
-    def __post_init__(self) -> None:
-        self.parquet_dir.mkdir(parents=True, exist_ok=True)
-
 
 SETTINGS = Settings()
